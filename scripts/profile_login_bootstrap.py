@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -62,7 +63,10 @@ def main(profile_id: str):
     print(f"Browser executable: {executable}")
     print(f"Remote debugging port: {debug_port}")
     print("Complete login/security verification manually, then close the browser window.")
-    proc = subprocess.Popen(args, cwd=ROOT_DIR)  # noqa: S603
+    if os.environ.get("DISPLAY"):
+        proc = subprocess.Popen(args, cwd=ROOT_DIR)  # noqa: S603
+    else:
+        proc = subprocess.Popen(["xvfb-run", "-a", *args], cwd=ROOT_DIR)  # noqa: S603
     proc.wait()
 
 
