@@ -6,6 +6,7 @@ services:
     container_name: ${APP_CONTAINER_NAME:-gatewaygrok-api}
     ports:
       - "${APP_PORT:-8000}:8000"
+      - "${VNC_PORT:-5901}:5901"
     env_file:
       - .env
     volumes:
