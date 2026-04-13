@@ -45,9 +45,31 @@ def main(profile_id: str):
                 executable = p.chromium.executable_path
 
         debug_port = debug_port_for_profile(profile_id)
+        profile_dir = Path(profile.user_data_dir).resolve()
+        for lock_path in profile_dir.glob("Singleton*"):
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            for tmp_lock in Path("/tmp").glob(".org.chromium.Chromium.*"):
+                if tmp_lock.is_dir():
+                    for child in tmp_lock.iterdir():
+                        try:
+                            if child.is_file() or child.is_symlink():
+                                child.unlink()
+                        except FileNotFoundError:
+                            pass
+                    try:
+                        tmp_lock.rmdir()
+                    except OSError:
+                        pass
+        except FileNotFoundError:
+            pass
+
         args = [
             executable,
-            f"--user-data-dir={Path(profile.user_data_dir).resolve()}",
+            f"--user-data-dir={profile_dir}",
             "--new-window",
             "--start-maximized",
             "--no-first-run",
