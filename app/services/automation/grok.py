@@ -391,8 +391,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
         automation_settings: AutomationSettings,
     ) -> dict:
         del profile, automation_settings
-        title = await page.title()
-        preview = await self._body_preview(page)
+        title = ""
+        preview = ""
+        for _ in range(2):
+            try:
+                title = await page.title()
+                preview = await self._body_preview(page)
+                break
+            except Exception:  # noqa: BLE001
+                with suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
         combined = f"{title} {preview}"
         indicators = self._contains_any(
             combined,
