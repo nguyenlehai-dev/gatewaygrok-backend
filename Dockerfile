@@ -3,7 +3,9 @@ FROM mcr.microsoft.com/playwright/python:v1.52.0-jammy
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends x11vnc \
