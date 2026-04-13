@@ -14,6 +14,15 @@ from app.services.session_guard import ensure_profile_session_ready
 router = APIRouter()
 
 
+@router.get("/verify")
+def verify_client_key(api_key_record: ApiKey = Depends(require_api_key)):
+    return {
+        "status": "ok",
+        "name": api_key_record.name,
+        "key_prefix": api_key_record.key_prefix,
+    }
+
+
 @router.post("/jobs", response_model=JobRead, status_code=status.HTTP_201_CREATED)
 async def create_client_job(
     payload: ClientJobCreate,
