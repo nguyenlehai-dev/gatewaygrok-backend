@@ -50,6 +50,7 @@ def main(profile_id: str):
             "--start-maximized",
             "--no-first-run",
             "--disable-dev-shm-usage",
+            "--no-sandbox",
             f"--remote-debugging-port={debug_port}",
             provider.start_url,
         ]
