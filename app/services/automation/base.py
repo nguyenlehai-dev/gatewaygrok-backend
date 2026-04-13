@@ -145,6 +145,13 @@ class BaseAutomationProvider(ABC):
         with suppress(Exception):
             await playwright.stop()
 
+    async def _close_extra_pages(self, context: BrowserContext, keep_page: Page) -> None:
+        for page in list(context.pages):
+            if page is keep_page:
+                continue
+            with suppress(Exception):
+                await page.close()
+
     async def _prepare_page(self, page: Page, timeout_ms: int) -> None:
         page.set_default_timeout(timeout_ms)
         await page.goto(self.start_url, wait_until="domcontentloaded")
@@ -247,6 +254,7 @@ class BaseAutomationProvider(ABC):
             if connected_live_browser:
                 page = await context.new_page()
                 page.set_default_timeout(automation_settings.timeout_ms)
+                await self._close_extra_pages(context, page)
             else:
                 page = await self._resolve_page(context, automation_settings.timeout_ms)
             await self._prepare_page(page, automation_settings.timeout_ms)
