@@ -44,6 +44,14 @@ class BaseAutomationProvider(ABC):
         payload = json.loads(cookie_file.read_text(encoding="utf-8"))
         return payload.get("cookies", [])
 
+    def _storage_state_path(self, profile: Profile) -> str | None:
+        if not profile.cookie_file:
+            return None
+        cookie_file = Path(profile.cookie_file)
+        if not cookie_file.exists():
+            return None
+        return str(cookie_file)
+
     async def _open_context(
         self,
         profile: Profile,
@@ -81,8 +89,9 @@ class BaseAutomationProvider(ABC):
         if executable_path:
             launch_kwargs["executable_path"] = executable_path
         cookies = self._cookie_payload(profile)
+        storage_state_path = self._storage_state_path(profile)
         browser: Browser | None = None
-        if cookies:
+        if cookies and storage_state_path:
             browser = await playwright.chromium.launch(
                 headless=automation_settings.headless,
                 proxy=self._proxy_options(proxy),
@@ -96,8 +105,8 @@ class BaseAutomationProvider(ABC):
                 timezone_id=antidetect.get("timezone_id") or "UTC",
                 user_agent=antidetect.get("user_agent"),
                 color_scheme=antidetect.get("color_scheme") or "dark",
+                storage_state=storage_state_path,
             )
-            await context.add_cookies(cookies)
         else:
             context = await playwright.chromium.launch_persistent_context(
                 profile.user_data_dir,
@@ -288,7 +297,7 @@ class BaseAutomationProvider(ABC):
             analysis["cookies"] = cookies
             if cookies:
                 cookie_path = profile_storage.cookie_state_path(profile.id)
-                cookie_path.write_text(json.dumps({"cookies": cookies, "origins": []}, indent=2), encoding="utf-8")
+                await context.storage_state(path=str(cookie_path))
                 analysis["cookie_file"] = str(cookie_path)
             analysis["body_preview"] = await self._body_preview(page)
             return analysis
