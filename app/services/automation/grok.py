@@ -1,4 +1,5 @@
 import base64
+import re
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -163,6 +164,55 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
+    async def _set_aspect_ratio(self, page: Page, aspect_ratio: str | None) -> None:
+        if not aspect_ratio:
+            return
+        ratio = aspect_ratio.strip()
+        if not ratio:
+            return
+
+        ratio_pattern = re.compile(r"\b\d+:\d+\b")
+        with suppress(Exception):
+            current = page.locator("button", has_text=ratio_pattern).first
+            if await current.count() > 0:
+                text = (await current.inner_text()).strip()
+                if ratio in text:
+                    return
+
+        trigger_selectors = [
+            f"button:has-text('{ratio}')",
+            "button[aria-label*='ratio' i]",
+            "button[aria-label*='aspect' i]",
+            "button[role='combobox']",
+        ]
+        trigger = None
+        for selector in trigger_selectors:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                trigger = locator
+                break
+        if trigger is None:
+            trigger = page.locator("button", has_text=ratio_pattern).first
+        if trigger and await trigger.count() > 0:
+            with suppress(Exception):
+                await trigger.click()
+                await page.wait_for_timeout(200)
+
+        option_selectors = [
+            f"[role='menuitem']:has-text('{ratio}')",
+            f"[role='option']:has-text('{ratio}')",
+            f"button:has-text('{ratio}')",
+            f"div:has-text('{ratio}')",
+            f"li:has-text('{ratio}')",
+        ]
+        for selector in option_selectors:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                with suppress(Exception):
+                    await locator.click()
+                    await page.wait_for_timeout(200)
+                    return
+
     async def _dismiss_quality_popup(self, page: Page) -> None:
         popup_label = "Choose quality for detailed generations"
         with suppress(Exception):
@@ -278,7 +328,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 localized.append(url)
         return localized
 
-    async def _open_imagine_video_flow(self, page: Page, prompt: str, source_asset_path: str | None) -> None:
+    async def _open_imagine_video_flow(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None,
+        aspect_ratio: str | None = None,
+    ) -> None:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
         video_mode = await self._wait_for_action_button(
             page,
@@ -299,6 +355,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
             upload_input = await self._first_visible(page, ["input[type='file']"])
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2000)
+
+        await self._set_aspect_ratio(page, aspect_ratio)
 
         if prompt.strip():
             await self._dismiss_quality_popup(page)
@@ -321,7 +379,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
         await submit.click()
 
-    async def _open_imagine_image_flow(self, page: Page, prompt: str, source_asset_path: str | None = None) -> None:
+    async def _open_imagine_image_flow(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None = None,
+        aspect_ratio: str | None = None,
+    ) -> None:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
         with suppress(Exception):
             image_mode = await self._wait_for_action_button(
@@ -343,6 +407,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
             upload_input = await self._first_visible(page, ["input[type='file']"])
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2500)
+
+        await self._set_aspect_ratio(page, aspect_ratio)
 
         if prompt.strip():
             await self._dismiss_quality_popup(page)
@@ -476,11 +542,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
         del automation_settings
         provider_payload = job.provider_payload or {}
         source_asset_path = provider_payload.get("source_asset_path")
+        aspect_ratio = provider_payload.get("aspect_ratio") or provider_payload.get("ratio")
 
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             if video_mode in {"text_to_video", "image_to_video"}:
-                await self._open_imagine_video_flow(page, job.prompt, source_asset_path if video_mode == "image_to_video" else None)
+                await self._open_imagine_video_flow(
+                    page,
+                    job.prompt,
+                    source_asset_path if video_mode == "image_to_video" else None,
+                    aspect_ratio,
+                )
                 media_urls = await self._download_file(page, profile, job, "video")
                 if not media_urls and source_asset_path is None:
                     media_urls = await self._download_video_asset(page, profile, job)
@@ -491,7 +563,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     "media_urls": media_urls,
                 }
 
-        await self._open_imagine_image_flow(page, job.prompt, source_asset_path)
+        await self._open_imagine_image_flow(page, job.prompt, source_asset_path, aspect_ratio)
 
         media_urls = await self._wait_for_filtered_media(page, job.target.value)
         media_urls = await self._localize_image_media(page, profile, job, media_urls)
