@@ -163,6 +163,34 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
+    async def _dismiss_quality_popup(self, page: Page) -> None:
+        popup_label = "Choose quality for detailed generations"
+        with suppress(Exception):
+            popup = page.locator(f"text={popup_label}").first
+            if await popup.count() == 0:
+                return
+
+            close_selectors = [
+                "button:has-text('Got it')",
+                "button:has-text('Close')",
+                "button:has-text('Dismiss')",
+                "button[aria-label='Close']",
+                "div[data-radix-popper-content-wrapper] button",
+            ]
+            for selector in close_selectors:
+                locator = page.locator(selector).first
+                if await locator.count() > 0:
+                    with suppress(Exception):
+                        await locator.click()
+                        await page.wait_for_timeout(300)
+                        return
+
+            with suppress(Exception):
+                await page.keyboard.press("Escape")
+            with suppress(Exception):
+                await page.mouse.click(10, 10)
+            await page.wait_for_timeout(300)
+
     async def _wait_for_filtered_media(self, page: Page, target: str, attempts: int = 18, delay_ms: int = 4000) -> list[str]:
         latest: list[str] = []
         best_complete: list[str] = []
@@ -273,6 +301,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(2000)
 
         if prompt.strip():
+            await self._dismiss_quality_popup(page)
             await self._fill_prompt(
                 page,
                 [
@@ -316,6 +345,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(2500)
 
         if prompt.strip():
+            await self._dismiss_quality_popup(page)
             await self._fill_prompt(
                 page,
                 [
