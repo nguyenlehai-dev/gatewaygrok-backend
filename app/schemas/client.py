@@ -4,7 +4,7 @@ from app.models.automation_job import JobTarget
 
 
 class ClientJobCreate(BaseModel):
-    profile_id: str
+    profile_id: str | None = None
     target: JobTarget
     prompt: str
     negative_prompt: str | None = None

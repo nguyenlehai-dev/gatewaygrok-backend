@@ -163,6 +163,105 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
+    async def _try_click_matching_option(self, page: Page, values: list[str]) -> bool:
+        normalized_values = [value.strip() for value in values if value and value.strip()]
+        if not normalized_values:
+            return False
+
+        selectors: list[str] = []
+        for value in normalized_values:
+            selectors.extend(
+                [
+                    f"button[role='option']:has-text('{value}')",
+                    f"button[role='radio']:has-text('{value}')",
+                    f"[role='option']:has-text('{value}')",
+                    f"[role='menuitemradio']:has-text('{value}')",
+                    f"label:has-text('{value}')",
+                    f"button:has-text('{value}')",
+                    f"text='{value}'",
+                ]
+            )
+
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() > 0:
+                    await locator.click(timeout=1500)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    async def _try_open_dropdown(self, page: Page, labels: list[str]) -> bool:
+        selectors: list[str] = []
+        for label in labels:
+            selectors.extend(
+                [
+                    f"button[aria-label*='{label}' i]",
+                    f"[aria-label*='{label}' i] button",
+                    f"button:has-text('{label}')",
+                    f"label:has-text('{label}')",
+                    f"[role='button']:has-text('{label}')",
+                    f"text='{label}'",
+                ]
+            )
+
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() > 0:
+                    await locator.click(timeout=1500)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    async def _apply_generation_options(
+        self,
+        page: Page,
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+        duration: int | str | None = None,
+    ) -> dict:
+        applied: dict[str, str | int] = {}
+
+        if ratio:
+            ratio_value = str(ratio).strip()
+            if await self._try_click_matching_option(page, [ratio_value]):
+                applied["ratio"] = ratio_value
+            elif await self._try_open_dropdown(page, ["Aspect ratio", "Ratio"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, [ratio_value]):
+                    applied["ratio"] = ratio_value
+
+        if quality:
+            quality_value = str(quality).strip()
+            quality_candidates = [quality_value, quality_value.title(), quality_value.upper()]
+            if await self._try_click_matching_option(page, quality_candidates):
+                applied["quality"] = quality_value
+            elif await self._try_open_dropdown(page, ["Quality"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, quality_candidates):
+                    applied["quality"] = quality_value
+
+        if duration is not None and str(duration).strip():
+            duration_value = str(duration).strip()
+            duration_candidates = [
+                duration_value,
+                f"{duration_value}s",
+                f"{duration_value} sec",
+                f"{duration_value} seconds",
+            ]
+            if await self._try_click_matching_option(page, duration_candidates):
+                applied["duration"] = duration_value
+            elif await self._try_open_dropdown(page, ["Duration", "Length"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, duration_candidates):
+                    applied["duration"] = duration_value
+
+        return applied
+
     async def _wait_for_filtered_media(self, page: Page, target: str, attempts: int = 18, delay_ms: int = 4000) -> list[str]:
         latest: list[str] = []
         best_complete: list[str] = []
@@ -250,7 +349,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 localized.append(url)
         return localized
 
-    async def _open_imagine_video_flow(self, page: Page, prompt: str, source_asset_path: str | None) -> None:
+    async def _open_imagine_video_flow(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None,
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+        duration: int | str | None = None,
+    ) -> dict:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
         video_mode = await self._wait_for_action_button(
             page,
@@ -272,6 +380,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2000)
 
+        applied_options = await self._apply_generation_options(
+            page,
+            ratio=ratio,
+            quality=quality,
+            duration=duration,
+        )
+
         if prompt.strip():
             await self._fill_prompt(
                 page,
@@ -291,8 +406,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ],
         )
         await submit.click()
+        return applied_options
 
-    async def _open_imagine_image_flow(self, page: Page, prompt: str, source_asset_path: str | None = None) -> None:
+    async def _open_imagine_image_flow(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None = None,
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+    ) -> dict:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
         with suppress(Exception):
             image_mode = await self._wait_for_action_button(
@@ -314,6 +438,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
             upload_input = await self._first_visible(page, ["input[type='file']"])
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2500)
+
+        applied_options = await self._apply_generation_options(
+            page,
+            ratio=ratio,
+            quality=quality,
+        )
 
         if prompt.strip():
             await self._fill_prompt(
@@ -338,6 +468,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ],
         )
         await submit_locator.click()
+        return applied_options
 
     async def _download_file(self, page: Page, profile: Profile, job: AutomationJob, suffix_label: str) -> list[str]:
         download_button = await self._wait_for_action_button(
@@ -446,11 +577,21 @@ class GrokAutomationProvider(BaseAutomationProvider):
         del automation_settings
         provider_payload = job.provider_payload or {}
         source_asset_path = provider_payload.get("source_asset_path")
+        ratio = provider_payload.get("ratio") or provider_payload.get("aspect_ratio")
+        quality = provider_payload.get("quality")
+        duration = provider_payload.get("duration")
 
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             if video_mode in {"text_to_video", "image_to_video"}:
-                await self._open_imagine_video_flow(page, job.prompt, source_asset_path if video_mode == "image_to_video" else None)
+                applied_options = await self._open_imagine_video_flow(
+                    page,
+                    job.prompt,
+                    source_asset_path if video_mode == "image_to_video" else None,
+                    ratio=str(ratio) if ratio else None,
+                    quality=str(quality) if quality else None,
+                    duration=duration,
+                )
                 media_urls = await self._download_file(page, profile, job, "video")
                 if not media_urls and source_asset_path is None:
                     media_urls = await self._download_video_asset(page, profile, job)
@@ -458,16 +599,29 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     "target": job.target.value,
                     "video_mode": video_mode,
                     "source_asset_path": source_asset_path,
+                    "ratio": ratio,
+                    "quality": quality,
+                    "duration": duration,
+                    "applied_options": applied_options,
                     "media_urls": media_urls,
                 }
 
-        await self._open_imagine_image_flow(page, job.prompt, source_asset_path)
+        applied_options = await self._open_imagine_image_flow(
+            page,
+            job.prompt,
+            source_asset_path,
+            ratio=str(ratio) if ratio else None,
+            quality=str(quality) if quality else None,
+        )
 
         media_urls = await self._wait_for_filtered_media(page, job.target.value)
         media_urls = await self._localize_image_media(page, profile, job, media_urls)
         return {
             "target": job.target.value,
             "source_asset_path": source_asset_path,
+            "ratio": ratio,
+            "quality": quality,
+            "applied_options": applied_options,
             "media_urls": media_urls,
         }
 
