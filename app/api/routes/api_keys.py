@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
@@ -31,13 +32,17 @@ def list_api_keys(db: Session = Depends(db_session)):
 
 @router.post("", response_model=ApiKeyCreated, status_code=status.HTTP_201_CREATED)
 def create_api_key(payload: ApiKeyCreate, db: Session = Depends(db_session)):
-    record, plain_key = api_key_service.create(
-        db,
-        name=payload.name,
-        rate_limit_per_minute=payload.rate_limit_per_minute,
-        allowed_categories=payload.allowed_categories,
-        notes=payload.notes,
-    )
+    try:
+        record, plain_key = api_key_service.create(
+            db,
+            name=payload.name,
+            rate_limit_per_minute=payload.rate_limit_per_minute,
+            allowed_categories=payload.allowed_categories,
+            notes=payload.notes,
+        )
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="API key name already exists")
     serialized = serialize(record)
     return ApiKeyCreated(**serialized.model_dump(), plain_key=plain_key)
 
