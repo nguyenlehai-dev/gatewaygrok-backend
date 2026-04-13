@@ -1,0 +1,39 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - staging
+      - prod
+  workflow_dispatch:
+
+jobs:
+  deploy-staging:
+    if: github.ref == 'refs/heads/staging'
+    runs-on: [self-hosted, gateway-dev]
+    steps:
+      - name: Deploy backend on VM dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /home/vpsroot/apps/gatewaygrok-staging/be
+          git fetch origin
+          git checkout staging
+          git reset --hard origin/staging
+          chmod +x scripts/deploy-compose.sh
+          ./scripts/deploy-compose.sh
+
+  deploy-prod:
+    if: github.ref == 'refs/heads/prod'
+    runs-on: [self-hosted, gateway-prod]
+    steps:
+      - name: Deploy backend on VM pro
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /home/vpsroot/apps/gatewaygrok-prod/be
+          git fetch origin
+          git checkout prod
+          git reset --hard origin/prod
+          chmod +x scripts/deploy-compose.sh
+          ./scripts/deploy-compose.sh
