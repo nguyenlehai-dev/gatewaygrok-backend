@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,8 +15,16 @@ from app.models.profile import Profile, ProfileCategory
 from app.schemas.profile import ProfileCreate, ProfileRead, ProfileUpdate
 from app.schemas.interactive_login import InteractiveLoginLaunchRead
 from app.schemas.profile_asset import ProfileAssetRead
+from app.schemas.profile_runtime import (
+    ProfileRuntimeLaunchRead,
+    ProfileRuntimeLaunchRequest,
+    ProfileRuntimeStatusRead,
+    ProfileRuntimeStopRead,
+    ProfileRuntimeStopRequest,
+)
 from app.schemas.session_check import SessionCheckRead
 from app.services.automation.registry import get_provider
+from app.services.browser_runtime import debug_endpoint_for_profile, debug_port_for_profile, is_debug_port_open
 from app.services.cookie_importer import cookie_importer
 from app.services.profile_storage import profile_storage
 from app.services.settings_service import settings_service
@@ -27,6 +36,67 @@ default_domains = {
     ProfileCategory.FLOW: ".google.com",
     ProfileCategory.DREAMINA: ".dreamina.capcut.com",
 }
+
+
+def _profile_runtime_log_path(profile_id: str) -> Path:
+    return Path("storage") / f"runtime-{profile_id}.log"
+
+
+def _pgrep_lines(pattern: str) -> list[str]:
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["pgrep", "-af", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return []
+
+    if result.returncode not in (0, 1):
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _runtime_bootstrap_processes(profile_id: str) -> list[str]:
+    return _pgrep_lines(f"profile_runtime_bootstrap.py --profile-id {profile_id}")
+
+
+def _browser_processes_for_profile(profile: Profile) -> list[str]:
+    if not profile.user_data_dir:
+        return []
+    return [
+        line
+        for line in _pgrep_lines(str(Path(profile.user_data_dir).resolve()))
+        if "chrome-linux/chrome" in line and "--user-data-dir=" in line
+    ]
+
+
+def _remove_display_artifacts(display: str) -> None:
+    if not display:
+        return
+    display_id = display.lstrip(":")
+    lock_path = Path(f"/tmp/.X{display_id}-lock")
+    socket_path = Path(f"/tmp/.X11-unix/X{display_id}")
+    if lock_path.exists():
+        lock_path.unlink()
+    if socket_path.exists():
+        socket_path.unlink()
+
+
+def _runtime_status(profile: Profile, provider_name: str, display: str | None = None) -> ProfileRuntimeStatusRead:
+    return ProfileRuntimeStatusRead(
+        profile_id=profile.id,
+        provider=provider_name,
+        requires_live_browser=True,
+        running=bool(_runtime_bootstrap_processes(profile.id) or _browser_processes_for_profile(profile)),
+        debug_port=debug_port_for_profile(profile.id),
+        debug_endpoint=debug_endpoint_for_profile(profile.id),
+        debug_port_open=is_debug_port_open(profile.id),
+        browser_process_count=len(_browser_processes_for_profile(profile)),
+        log_path=str(_profile_runtime_log_path(profile.id)),
+        display=display,
+    )
 
 
 @router.get("", response_model=list[ProfileRead])
@@ -187,4 +257,123 @@ def launch_login(profile_id: str, db: Session = Depends(db_session)):
         profile_id=profile_id,
         provider=provider.provider_name,
         message=f"Interactive login browser launched. Complete login manually, then close the window. Log: {log_path}",
+    )
+
+
+@router.get("/{profile_id}/runtime-status", response_model=ProfileRuntimeStatusRead)
+def runtime_status(profile_id: str, db: Session = Depends(db_session)):
+    profile = db.get(Profile, profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    provider = get_provider(profile.category)
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Provider not available for profile category")
+
+    return _runtime_status(profile, provider.provider_name)
+
+
+@router.post("/{profile_id}/launch-runtime", response_model=ProfileRuntimeLaunchRead)
+def launch_runtime(
+    profile_id: str,
+    payload: ProfileRuntimeLaunchRequest | None = None,
+    db: Session = Depends(db_session),
+):
+    profile = db.get(Profile, profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    provider = get_provider(profile.category)
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Provider not available for profile category")
+
+    running_bootstrap = _runtime_bootstrap_processes(profile.id)
+    running_browser = _browser_processes_for_profile(profile)
+    log_path = _profile_runtime_log_path(profile.id)
+    display = payload.display if payload else None
+
+    if running_bootstrap or (running_browser and is_debug_port_open(profile.id)):
+        return ProfileRuntimeLaunchRead(
+            launched=True,
+            profile_id=profile.id,
+            provider=provider.provider_name,
+            debug_port=debug_port_for_profile(profile.id),
+            debug_endpoint=debug_endpoint_for_profile(profile.id),
+            log_path=str(log_path),
+            display=display,
+            message="Runtime browser already running for profile.",
+        )
+
+    script_path = Path("scripts/profile_runtime_bootstrap.py").resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("w", encoding="utf-8")
+    log_file.write(f"Launching runtime browser for {profile.id} ({provider.provider_name})\n")
+    log_file.flush()
+
+    command = [sys.executable, str(script_path), "--profile-id", profile.id]
+    start_url = payload.start_url if payload else None
+    if start_url:
+        command.extend(["--url", start_url])
+
+    env = None
+    if display:
+        env = os.environ.copy()
+        env["GATEWAY_XVFB_DISPLAY"] = display
+
+    subprocess.Popen(  # noqa: S603
+        command,
+        cwd=Path.cwd(),
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    return ProfileRuntimeLaunchRead(
+        launched=True,
+        profile_id=profile.id,
+        provider=provider.provider_name,
+        debug_port=debug_port_for_profile(profile.id),
+        debug_endpoint=debug_endpoint_for_profile(profile.id),
+        log_path=str(log_path),
+        display=display,
+        message="No-VNC runtime browser launched for automation.",
+    )
+
+
+@router.post("/{profile_id}/stop-runtime", response_model=ProfileRuntimeStopRead)
+def stop_runtime(
+    profile_id: str,
+    payload: ProfileRuntimeStopRequest | None = None,
+    db: Session = Depends(db_session),
+):
+    profile = db.get(Profile, profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    provider = get_provider(profile.category)
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Provider not available for profile category")
+
+    subprocess.run(  # noqa: S603
+        ["pkill", "-f", f"profile_runtime_bootstrap.py --profile-id {profile.id}"],
+        check=False,
+    )
+    if profile.user_data_dir:
+        subprocess.run(  # noqa: S603
+            ["pkill", "-f", str(Path(profile.user_data_dir).resolve())],
+            check=False,
+        )
+
+    display = payload.display if payload else None
+    if display:
+        subprocess.run(["pkill", "-f", f"Xvfb {display}"], check=False)  # noqa: S603
+        _remove_display_artifacts(display)
+
+    return ProfileRuntimeStopRead(
+        stopped=True,
+        profile_id=profile.id,
+        provider=provider.provider_name,
+        log_path=str(_profile_runtime_log_path(profile.id)),
+        display=display,
+        message="No-VNC runtime browser stop requested for profile.",
     )

@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 storage/
+storage-test/
 node_modules/
 .env
+.env.test
 .pytest_cache/
 *.log

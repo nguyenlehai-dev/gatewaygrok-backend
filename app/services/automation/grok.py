@@ -1,4 +1,5 @@
 import base64
+import re
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,6 +17,72 @@ class GrokAutomationProvider(BaseAutomationProvider):
     provider_name = "grok"
     start_url = "https://grok.com/"
 
+    async def _body_marker(self, page: Page) -> str:
+        with suppress(Exception):
+            preview = await self._body_preview(page)
+            return " ".join(preview.split()).lower()
+        return ""
+
+    async def _submit_from_editor(self, page: Page, selectors: list[str]) -> None:
+        before = await self._body_marker(page)
+
+        with suppress(Exception):
+            await self._submit_generation(page, selectors)
+            return
+
+        with suppress(Exception):
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1500)
+
+        after_enter = await self._body_marker(page)
+        if after_enter and after_enter != before:
+            return
+
+        await self._submit_generation(page, selectors)
+
+    async def _ensure_imagine_page(self, page: Page) -> None:
+        if page.url.startswith("https://grok.com/imagine/post"):
+            await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+            return
+
+        if page.url.rstrip("/") == "https://grok.com/imagine":
+            return
+
+        title = ""
+        preview = ""
+        with suppress(Exception):
+            title = await page.title()
+        with suppress(Exception):
+            preview = await self._body_preview(page)
+
+        combined = f"{title} {preview}".lower()
+        if "security verification" in combined or "just a moment" in combined:
+            await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+            return
+
+        nav_selectors = [
+            "a[href='/imagine']",
+            "a[href='https://grok.com/imagine']",
+            "[role='link'][href='/imagine']",
+            "button:has-text('Imagine')",
+            "[role='button']:has-text('Imagine')",
+            "text=Imagine",
+        ]
+        for selector in nav_selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() == 0:
+                    continue
+                await locator.click(timeout=2000)
+                with suppress(Exception):
+                    await page.wait_for_url("**/imagine**", timeout=8000)
+                if "/imagine" in page.url:
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+
+        await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+
     async def _extract_image_candidates(self, page: Page) -> list[dict]:
         return await page.evaluate(
             r"""
@@ -25,6 +92,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
               const images = Array.from(document.querySelectorAll("img"));
               const candidates = [];
               const seen = new Set();
+              const pushCandidate = (candidate) => {
+                if (!candidate.src || seen.has(candidate.src)) {
+                  return;
+                }
+                seen.add(candidate.src);
+                candidates.push(candidate);
+              };
 
               for (const [index, image] of images.entries()) {
                 const rect = image.getBoundingClientRect();
@@ -49,11 +123,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                   continue;
                 }
 
-                if (!src.startsWith("data:image/") && !src.includes("assets.grok.com")) {
+                if (!src) {
                   continue;
                 }
 
-                if (image.naturalWidth < 700 || image.naturalHeight < 900) {
+                if (image.naturalWidth < 320 || image.naturalHeight < 320) {
                   continue;
                 }
 
@@ -79,13 +153,53 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 }
                 score += Math.round((rect.width * rect.height) / 1000);
 
-                seen.add(src);
-                candidates.push({
+                pushCandidate({
                   index,
                   src,
                   score,
                   promptMatch,
                   comparePanel,
+                  rectY: rect.y,
+                  rectX: rect.x,
+                });
+              }
+
+              const backgroundNodes = Array.from(document.querySelectorAll("div, button, a, section, article"));
+              for (const [index, node] of backgroundNodes.entries()) {
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 280 || rect.height < 280 || rect.bottom <= 0 || rect.right <= 0) {
+                  continue;
+                }
+                const style = window.getComputedStyle(node);
+                if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") <= 0.05) {
+                  continue;
+                }
+                const bg = style.backgroundImage || "";
+                const match = bg.match(/url\((['"]?)(.*?)\1\)/i);
+                const src = match?.[2] || "";
+                if (!src) {
+                  continue;
+                }
+
+                const text = normalize(node.textContent || "");
+                const promptMatch = Boolean(prompt) && text.includes(prompt);
+                let score = Math.round((rect.width * rect.height) / 1000) + 180;
+                if (promptMatch) {
+                  score += 1000;
+                }
+                if (src.startsWith("data:image/")) {
+                  score += 80;
+                }
+                if (src.startsWith("blob:")) {
+                  score += 60;
+                }
+
+                pushCandidate({
+                  index: images.length + index,
+                  src,
+                  score,
+                  promptMatch,
+                  comparePanel: false,
                   rectY: rect.y,
                   rectX: rect.x,
                 });
@@ -119,6 +233,59 @@ class GrokAutomationProvider(BaseAutomationProvider):
             """
         )
 
+    async def _extract_image_panels(self, page: Page) -> list[dict]:
+        return await page.evaluate(
+            r"""
+            () => {
+              const items = [];
+              const seen = new Set();
+              const pushItem = (rect, score) => {
+                const key = [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)].join(':');
+                if (seen.has(key)) {
+                  return;
+                }
+                seen.add(key);
+                items.push({
+                  x: Math.max(0, rect.x),
+                  y: Math.max(0, rect.y),
+                  width: Math.max(1, rect.width),
+                  height: Math.max(1, rect.height),
+                  score,
+                });
+              };
+
+              for (const node of Array.from(document.querySelectorAll('img, div, button, a, section, article'))) {
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 240 || rect.height < 240 || rect.bottom <= 0 || rect.right <= 0) {
+                  continue;
+                }
+                const style = window.getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') <= 0.05) {
+                  continue;
+                }
+
+                const src = node.currentSrc || node.src || '';
+                const bg = style.backgroundImage || '';
+                const hasMedia =
+                  src.startsWith('data:image/') ||
+                  src.startsWith('blob:') ||
+                  src.startsWith('http://') ||
+                  src.startsWith('https://') ||
+                  /url\(/i.test(bg);
+
+                if (!hasMedia) {
+                  continue;
+                }
+
+                const score = Math.round((rect.width * rect.height) / 1000);
+                pushItem(rect, score);
+              }
+
+              return items.sort((a, b) => b.score - a.score || a.y - b.y || a.x - b.x).slice(0, 6);
+            }
+            """
+        )
+
     async def _extract_media_urls(self, page: Page, target: str) -> list[str]:
         if target != "image":
             return await super()._extract_media_urls(page, target)
@@ -143,9 +310,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     seen.add(normalized)
                     filtered.append(normalized)
                     continue
-                if "assets.grok.com" not in normalized:
+                if normalized.startswith("blob:"):
+                    seen.add(normalized)
+                    filtered.append(normalized)
                     continue
-                if not any(ext in normalized.lower() for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+                if not normalized.startswith("http://") and not normalized.startswith("https://"):
                     continue
             elif target == "video":
                 if not any(ext in normalized.lower() for ext in [".mp4", ".webm", ".mov"]):
@@ -158,8 +327,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
         for _ in range(attempts):
             for selector in selectors:
                 locator = page.locator(selector).first
-                if await locator.count() > 0:
+                try:
+                    await locator.wait_for(state="visible", timeout=min(delay_ms, 1500))
                     return locator
+                except Exception:  # noqa: BLE001
+                    with suppress(Exception):
+                        if await locator.count() > 0 and await locator.is_visible():
+                            return locator
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
@@ -167,6 +341,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         normalized_values = [value.strip() for value in values if value and value.strip()]
         if not normalized_values:
             return False
+
+        if await self._click_exact_option(page, normalized_values):
+            return True
 
         selectors: list[str] = []
         for value in normalized_values:
@@ -191,6 +368,106 @@ class GrokAutomationProvider(BaseAutomationProvider):
             except Exception:  # noqa: BLE001
                 continue
         return False
+
+    async def _click_exact_option(self, page: Page, values: list[str]) -> bool:
+        normalized_values = {value.strip().lower() for value in values if value and value.strip()}
+        if not normalized_values:
+            return False
+
+        candidate_selectors = [
+            "button",
+            "[role='option']",
+            "[role='radio']",
+            "[role='menuitemradio']",
+            "label",
+            "[role='button']",
+        ]
+
+        for selector in candidate_selectors:
+            locator = page.locator(selector)
+            try:
+                count = await locator.count()
+            except Exception:  # noqa: BLE001
+                continue
+
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    text = await candidate.inner_text()
+                except Exception:  # noqa: BLE001
+                    continue
+
+                normalized_text = re.sub(r"\s+", " ", text).strip().lower()
+                if normalized_text not in normalized_values:
+                    continue
+
+                try:
+                    await candidate.click(timeout=1500)
+                    return True
+                except Exception:  # noqa: BLE001
+                    continue
+
+        return False
+
+    async def _submit_generation(self, page: Page, selectors: list[str]) -> None:
+        submit = None
+        for _ in range(30):
+            try:
+                submit = await self._first_visible(page, selectors)
+                await submit.wait_for(state="visible", timeout=1500)
+                disabled = await submit.get_attribute("disabled")
+                aria_disabled = await submit.get_attribute("aria-disabled")
+                is_enabled = await submit.is_enabled()
+            except Exception:  # noqa: BLE001
+                disabled = None
+                aria_disabled = None
+                is_enabled = True
+
+            if disabled is None and aria_disabled not in {"true", "True"} and is_enabled:
+                break
+            await page.wait_for_timeout(1000)
+        else:
+            raise RuntimeError("Submit button stayed disabled. Grok did not accept the current prompt/input state.")
+
+        try:
+            await submit.click(timeout=5000)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+        await page.evaluate(
+            """
+            (selectorList) => {
+              const findButton = (selector) => {
+                const textMatch = selector.match(/^(.*):has-text\\((['"])(.*)\\2\\)$/);
+                if (textMatch) {
+                  const base = textMatch[1] || "*";
+                  const expected = textMatch[3].toLowerCase();
+                  return Array.from(document.querySelectorAll(base))
+                    .find((node) => (node.innerText || node.textContent || "").toLowerCase().includes(expected));
+                }
+                return document.querySelector(selector);
+              };
+
+              for (const selector of selectorList) {
+                const button = findButton(selector);
+                if (!button) {
+                  continue;
+                }
+                if (button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true') {
+                  continue;
+                }
+                button.click();
+                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+              }
+              return false;
+            }
+            """,
+            selectors,
+        )
 
     async def _try_open_dropdown(self, page: Page, labels: list[str]) -> bool:
         selectors: list[str] = []
@@ -228,11 +505,22 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         if ratio:
             ratio_value = str(ratio).strip()
-            if await self._try_click_matching_option(page, [ratio_value]):
+            ratio_candidates = [ratio_value]
+            ratio_aliases = {
+                "1:1": ["1x1", "square"],
+                "9:16": ["9x16", "portrait", "vertical"],
+                "16:9": ["16x9", "landscape", "horizontal"],
+                "3:4": ["3x4", "portrait"],
+                "4:3": ["4x3", "classic"],
+                "2:3": ["2x3", "portrait"],
+                "3:2": ["3x2", "landscape"],
+            }
+            ratio_candidates.extend(ratio_aliases.get(ratio_value, []))
+            if await self._try_click_matching_option(page, ratio_candidates):
                 applied["ratio"] = ratio_value
             elif await self._try_open_dropdown(page, ["Aspect ratio", "Ratio"]):
                 await page.wait_for_timeout(400)
-                if await self._try_click_matching_option(page, [ratio_value]):
+                if await self._try_click_matching_option(page, ratio_candidates):
                     applied["ratio"] = ratio_value
 
         if quality:
@@ -309,6 +597,45 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         return await self._run_in_thread(_write)
 
+    async def _localize_video_media(self, page: Page, profile: Profile, job: AutomationJob, media_urls: list[str]) -> list[str]:
+        output_dir = profile_storage.output_dir(profile.id)
+        localized: list[str] = []
+        for index, url in enumerate(media_urls, start=1):
+            if not url.startswith("http://") and not url.startswith("https://"):
+                localized.append(url)
+                continue
+
+            suffix = Path(urlparse(url).path).suffix.lower() or ".mp4"
+            target_path = output_dir / f"{job.id}-video-{index}{suffix}"
+            try:
+                localized.append(await self._download_remote_media(page, url, target_path))
+            except Exception:  # noqa: BLE001
+                localized.append(url)
+        return localized
+
+    async def _capture_image_panel_fallback(self, page: Page, profile: Profile, job: AutomationJob) -> list[str]:
+        panels = await self._extract_image_panels(page)
+        if not panels:
+            return []
+
+        output_dir = profile_storage.output_dir(profile.id)
+        captured: list[str] = []
+        viewport = page.viewport_size or {"width": 1440, "height": 900}
+
+        for index, panel in enumerate(panels[:4], start=1):
+            x = max(0, int(panel.get("x", 0)))
+            y = max(0, int(panel.get("y", 0)))
+            width = max(1, int(panel.get("width", 1)))
+            height = max(1, int(panel.get("height", 1)))
+            if x + width > viewport["width"]:
+                width = max(1, viewport["width"] - x)
+            if y + height > viewport["height"]:
+                height = max(1, viewport["height"] - y)
+            target_path = output_dir / f"{job.id}-image-{index}.png"
+            await page.screenshot(path=str(target_path), clip={"x": x, "y": y, "width": width, "height": height})
+            captured.append(str(target_path))
+        return captured
+
     async def _save_data_url(self, data_url: str, target_path: Path) -> str:
         header, encoded = data_url.split(",", 1)
         payload = base64.b64decode(encoded)
@@ -359,26 +686,84 @@ class GrokAutomationProvider(BaseAutomationProvider):
         quality: str | None = None,
         duration: int | str | None = None,
     ) -> dict:
-        await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
-        video_mode = await self._wait_for_action_button(
-            page,
-            [
-                "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
-                "[aria-label='Generation mode'] >> text=Video",
-            ],
-            attempts=12,
-            delay_ms=2000,
-        )
-        if await video_mode.get_attribute("aria-checked") != "true":
-            await video_mode.click()
+        await self._ensure_imagine_page(page)
+        await self._dismiss_consent_overlays(page)
+        video_selectors = [
+            "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
+            "[aria-label='Generation mode'] >> text=Video",
+            "button[role='radio']:has-text('Video')",
+            "[role='tab']:has-text('Video')",
+            "button:has-text('Video')",
+        ]
+        upload_trigger_selectors = [
+            "button:has-text('Upload')",
+            "button:has-text('Add image')",
+            "button:has-text('Add reference')",
+            "[aria-label*='Upload' i]",
+            "[aria-label*='Add image' i]",
+        ]
+        uploaded_state_selectors = [
+            "button:has-text('Remove')",
+            "button[aria-label*='Remove' i]",
+            "img[src^='blob:']",
+            "img[src^='data:image']",
+        ]
+        try:
+            video_mode = await self._wait_for_action_button(
+                page,
+                video_selectors,
+                attempts=8,
+                delay_ms=2000,
+            )
+            if await video_mode.get_attribute("aria-checked") != "true":
+                await video_mode.click()
+        except Exception:  # noqa: BLE001
+            await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+            await self._dismiss_consent_overlays(page)
+            with suppress(Exception):
+                video_mode = await self._wait_for_action_button(
+                    page,
+                    video_selectors,
+                    attempts=6,
+                    delay_ms=1500,
+                )
+                if await video_mode.get_attribute("aria-checked") != "true":
+                    await video_mode.click()
 
         if source_asset_path:
             source_file = Path(source_asset_path)
             if not source_file.exists():
                 raise RuntimeError(f"Source asset not found: {source_asset_path}")
-            upload_input = await self._first_visible(page, ["input[type='file']"])
+            upload_input = await self._first_visible(page, ["input[type='file']"], allow_hidden=True)
             await upload_input.set_input_files(str(source_file))
-            await page.wait_for_timeout(2000)
+            upload_registered = False
+            for _ in range(12):
+                if await self._first_visible(page, uploaded_state_selectors, raise_on_empty=False):
+                    upload_registered = True
+                    break
+                with suppress(Exception):
+                    submit_probe = await self._first_visible(
+                        page,
+                        [
+                            "button[aria-label='Submit']",
+                            "button[type='submit']",
+                        ],
+                        raise_on_empty=False,
+                    )
+                    if submit_probe and await submit_probe.is_enabled():
+                        upload_registered = True
+                        break
+                await page.wait_for_timeout(500)
+            if not upload_registered:
+                for selector in upload_trigger_selectors:
+                    with suppress(Exception):
+                        trigger = page.locator(selector).first
+                        if await trigger.count() > 0 and await trigger.is_visible():
+                            await trigger.click(timeout=1500)
+                            break
+                await upload_input.set_input_files(str(source_file))
+                await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1000)
 
         applied_options = await self._apply_generation_options(
             page,
@@ -393,19 +778,41 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 [
                     "[contenteditable='true']",
                     "div[contenteditable='true']",
+                    "[contenteditable='true'][data-placeholder*='Type' i]",
+                    "div[contenteditable='true'][data-placeholder*='Type' i]",
                     "textarea",
+                    "textarea[placeholder*='Type' i]",
+                    "input[placeholder*='Type' i]",
                 ],
                 prompt,
             )
 
-        submit = await self._first_visible(
+        await self._dismiss_consent_overlays(page)
+        with suppress(Exception):
+            editor = await self._first_visible(
+                page,
+                [
+                    "[contenteditable='true']",
+                    "div[contenteditable='true']",
+                    "[contenteditable='true'][data-placeholder*='Type' i]",
+                    "div[contenteditable='true'][data-placeholder*='Type' i]",
+                    "textarea",
+                    "textarea[placeholder*='Type' i]",
+                    "input[placeholder*='Type' i]",
+                ],
+                raise_on_empty=False,
+            )
+            if editor:
+                await editor.click()
+                await page.keyboard.type(" ")
+                await page.keyboard.press("Backspace")
+        await self._submit_generation(
             page,
             [
                 "button[aria-label='Submit']",
                 "button[type='submit']",
             ],
         )
-        await submit.click()
         return applied_options
 
     async def _open_imagine_image_flow(
@@ -417,7 +824,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
         ratio: str | None = None,
         quality: str | None = None,
     ) -> dict:
-        await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+        await self._ensure_imagine_page(page)
+        await self._dismiss_consent_overlays(page)
         with suppress(Exception):
             image_mode = await self._wait_for_action_button(
                 page,
@@ -435,7 +843,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             source_file = Path(source_asset_path)
             if not source_file.exists():
                 raise RuntimeError(f"Source asset not found: {source_asset_path}")
-            upload_input = await self._first_visible(page, ["input[type='file']"])
+            upload_input = await self._first_visible(page, ["input[type='file']"], allow_hidden=True)
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2500)
 
@@ -452,13 +860,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     "[contenteditable='true']",
                     "div[contenteditable='true']",
                     "p[data-placeholder='Ask Grok']",
+                    "[contenteditable='true'][data-placeholder*='Type' i]",
+                    "div[contenteditable='true'][data-placeholder*='Type' i]",
                     "textarea",
                     "textarea[placeholder*='Ask']",
+                    "textarea[placeholder*='Type' i]",
+                    "input[placeholder*='Type' i]",
                 ],
                 prompt,
             )
 
-        submit_locator = await self._first_visible(
+        await self._submit_from_editor(
             page,
             [
                 "button[aria-label='Submit']",
@@ -467,7 +879,6 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "button:has-text('Generate')",
             ],
         )
-        await submit_locator.click()
         return applied_options
 
     async def _download_file(self, page: Page, profile: Profile, job: AutomationJob, suffix_label: str) -> list[str]:
@@ -522,33 +933,35 @@ class GrokAutomationProvider(BaseAutomationProvider):
         automation_settings: AutomationSettings,
     ) -> dict:
         del profile, automation_settings
+        patterns = [
+            "security verification",
+            "just a moment",
+            "sign in",
+            "log in",
+            "create image",
+            "generate",
+            "ask anything",
+            "ask grok",
+            "imagine",
+            "private",
+            "supergrok",
+        ]
         title = ""
         preview = ""
-        for _ in range(2):
+        indicators: list[str] = []
+        for _ in range(4):
             try:
                 title = await page.title()
                 preview = await self._body_preview(page)
-                break
+                indicators = self._contains_any(f"{title} {preview}", patterns)
+                if indicators:
+                    break
             except Exception:  # noqa: BLE001
                 with suppress(Exception):
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
-        combined = f"{title} {preview}"
-        indicators = self._contains_any(
-            combined,
-            [
-                "security verification",
-                "just a moment",
-                "sign in",
-                "log in",
-                "create image",
-                "generate",
-                "ask anything",
-                "ask grok",
-                "imagine",
-                "private",
-                "supergrok",
-            ],
-        )
+            with suppress(Exception):
+                await page.wait_for_timeout(1000)
+
         state = "unknown"
         summary = "Grok page loaded but no stable auth marker detected."
         if any(item in indicators for item in ["security verification", "just a moment"]):
@@ -560,6 +973,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         elif any(item in indicators for item in ["create image", "generate", "ask anything", "ask grok", "imagine", "private", "supergrok"]):
             state = "authenticated"
             summary = "Grok session appears ready for prompt submission."
+
         return {
             "state": state,
             "indicators": indicators,
@@ -592,9 +1006,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     quality=str(quality) if quality else None,
                     duration=duration,
                 )
-                media_urls = await self._download_file(page, profile, job, "video")
-                if not media_urls and source_asset_path is None:
-                    media_urls = await self._download_video_asset(page, profile, job)
+                media_urls = await self._wait_for_filtered_media(page, "video", attempts=36, delay_ms=5000)
+                media_urls = await self._localize_video_media(page, profile, job, media_urls)
+                if not media_urls:
+                    media_urls = await self._download_file(page, profile, job, "video")
                 return {
                     "target": job.target.value,
                     "video_mode": video_mode,
@@ -616,6 +1031,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         media_urls = await self._wait_for_filtered_media(page, job.target.value)
         media_urls = await self._localize_image_media(page, profile, job, media_urls)
+        if not media_urls:
+            media_urls = await self._capture_image_panel_fallback(page, profile, job)
         return {
             "target": job.target.value,
             "source_asset_path": source_asset_path,

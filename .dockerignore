@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 .env
 storage/
+storage-test/
 node_modules/
 dist/
 build/

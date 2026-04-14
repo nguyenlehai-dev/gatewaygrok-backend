@@ -18,8 +18,9 @@ from app.services.browser_runtime import debug_port_for_profile, resolve_browser
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Launch an interactive login browser for a profile.")
+    parser = argparse.ArgumentParser(description="Keep a profile browser running without VNC for automation.")
     parser.add_argument("--profile-id", required=True)
+    parser.add_argument("--url", default=None, help="Optional start URL override")
     return parser.parse_args()
 
 
@@ -46,7 +47,21 @@ def _browser_processes_for_user_data_dir(user_data_dir: Path) -> list[str]:
         lines.append(line)
     return lines
 
-def main(profile_id: str):
+
+def _xvfb_running(display: str) -> bool:
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["pgrep", "-af", f"Xvfb {display}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def main(profile_id: str, start_url_override: str | None):
     with SessionLocal() as db:
         profile = (
             db.query(Profile)
@@ -62,6 +77,7 @@ def main(profile_id: str):
             raise SystemExit(f"Provider not found for category: {profile.category.value}")
 
         user_data_dir = Path(profile.user_data_dir).resolve()
+        start_url = start_url_override or provider.start_url
 
         executable = resolve_browser_executable()
         if executable is None:
@@ -83,53 +99,45 @@ def main(profile_id: str):
             "--enable-unsafe-swiftshader",
             "--use-angle=swiftshader",
             f"--remote-debugging-port={debug_port}",
-            provider.start_url,
+            start_url,
         ]
 
         if profile.proxy and profile.proxy.enabled:
             args.append(f"--proxy-server={profile.proxy.kind}://{profile.proxy.server}:{profile.proxy.port}")
 
-    print(f"Interactive login opened for profile {profile_id} at {provider.start_url}")
+    print(f"Runtime browser opened for profile {profile_id} at {start_url}")
     print(f"Browser executable: {executable}")
     print(f"Remote debugging port: {debug_port}")
-    print("Complete login/security verification manually, then close the browser window.")
+    print("No VNC attached. Browser will stay alive for automation while the profile session remains open.")
+
     xvfb_proc = None
-    vnc_proc = None
     env = os.environ.copy()
-    display = env.get("DISPLAY") or env.get("GATEWAY_XVFB_DISPLAY", ":99")
-    vnc_port = env.get("GATEWAY_VNC_PORT", "5901")
-    vnc_password = env.get("GATEWAY_VNC_PASSWORD", "")
-    enable_vnc = env.get("GATEWAY_ENABLE_VNC", "1") != "0"
-
     if not env.get("DISPLAY"):
-        xvfb_proc = subprocess.Popen(  # noqa: S603
-            ["Xvfb", display, "-screen", "0", "1280x720x24"],
-            cwd=ROOT_DIR,
-        )
-        time.sleep(1.0)
+        display = env.get("GATEWAY_XVFB_DISPLAY", ":99")
+        if not _xvfb_running(display):
+            lock_path = Path(f"/tmp/.X{display.lstrip(':')}-lock")
+            socket_path = Path(f"/tmp/.X11-unix/X{display.lstrip(':')}")
+            if lock_path.exists():
+                lock_path.unlink()
+            if socket_path.exists():
+                socket_path.unlink()
+            xvfb_proc = subprocess.Popen(  # noqa: S603
+                ["Xvfb", display, "-screen", "0", "1280x720x24"],
+                cwd=ROOT_DIR,
+            )
+            time.sleep(1.0)
         env["DISPLAY"] = display
-
-    if enable_vnc:
-        vnc_args = ["x11vnc", "-display", display, "-rfbport", vnc_port, "-forever", "-shared"]
-        if vnc_password:
-            vnc_args += ["-passwd", vnc_password]
-        else:
-            vnc_args.append("-nopw")
-        vnc_proc = subprocess.Popen(vnc_args, cwd=ROOT_DIR)  # noqa: S603
 
     try:
         proc = subprocess.Popen(args, cwd=ROOT_DIR, env=env)  # noqa: S603
         proc.wait()
-        # Chromium may attach to an existing browser session and exit the launcher
-        # process immediately while the actual profile window stays alive.
         while _browser_processes_for_user_data_dir(user_data_dir):
             time.sleep(1.0)
     finally:
-        for child in (vnc_proc, xvfb_proc):
-            if child and child.poll() is None:
-                child.terminate()
+        if xvfb_proc and xvfb_proc.poll() is None:
+            xvfb_proc.terminate()
 
 
 if __name__ == "__main__":
     parsed = parse_args()
-    main(parsed.profile_id)
+    main(parsed.profile_id, parsed.url)

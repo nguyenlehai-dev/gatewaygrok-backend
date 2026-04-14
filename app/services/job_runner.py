@@ -110,12 +110,19 @@ class JobRunner:
 
             async with semaphore:
                 try:
-                    result = await provider.run(profile, profile.proxy, job, automation_settings)
+                    timeout_seconds = max(120, int(automation_settings.timeout_ms / 1000) * 2)
+                    result = await asyncio.wait_for(
+                        provider.run(profile, profile.proxy, job, automation_settings),
+                        timeout=timeout_seconds,
+                    )
                     if job.target.value in {"image", "video"} and not result.get("media_urls"):
                         raise RuntimeError(f"No media output captured for {job.target.value} job")
                     job.status = JobStatus.SUCCEEDED
                     job.result_payload = result
                     job.error_message = None
+                except TimeoutError:
+                    job.status = JobStatus.FAILED
+                    job.error_message = f"Automation timed out after {timeout_seconds}s"
                 except Exception as exc:  # noqa: BLE001
                     job.status = JobStatus.FAILED
                     job.error_message = str(exc)

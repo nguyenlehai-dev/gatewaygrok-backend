@@ -20,11 +20,13 @@ Authorization: Bearer <admin_token>
 
 1. Admin tao profile Grok.
 2. Admin login/import cookie cho profile.
-3. Admin goi `POST /api/profiles/{profile_id}/session-check` de xac nhan profile san sang.
-4. Neu can image-to-video, admin upload anh qua `POST /api/profiles/{profile_id}/assets`.
-5. Admin tao client key qua `POST /api/api-keys`.
-6. Client goi `POST /api/client/generate` (profile_id la optional).
-7. Client poll `GET /api/client/tasks/{task_id}` cho toi khi `succeeded` hoac `failed`.
+3. Neu session da mat, admin goi `POST /api/profiles/{profile_id}/launch-login` de bootstrap login lai.
+4. Sau khi login xong, admin goi `POST /api/profiles/{profile_id}/launch-runtime` de giu browser song theo huong no-VNC.
+5. Admin goi `POST /api/profiles/{profile_id}/session-check` de xac nhan profile san sang.
+6. Neu can image-to-video, admin upload anh qua `POST /api/profiles/{profile_id}/assets` hoac client gui URL anh (backend se auto-download).
+7. Admin tao client key qua `POST /api/api-keys`.
+8. Client goi `POST /api/client/generate` (profile_id la optional).
+9. Client poll `GET /api/client/tasks/{task_id}/status` de lay payload nhe, hoac `/tasks/{task_id}` neu can day du.
 
 ## Generate task
 
@@ -39,7 +41,7 @@ x-api-key: <plain_key>
   "target": "video",
   "prompt": "A cinematic shot of clouds moving fast over mountains",
   "reference_images": [
-    "storage/profiles/PROFILE_ID/assets/ref-mountains.png"
+    "https://images.example.com/ref-mountains.png"
   ],
   "ratio": "16:9",
   "quality": "high",
@@ -49,17 +51,19 @@ x-api-key: <plain_key>
 }
 ```
 
-Response:
+Response (compact) (use `POST /api/client/generate/status` for lite response):
 
 ```json
 {
   "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
   "status": "pending",
-  "poll_url": "/api/client/tasks/42d72140-8613-4a53-a1df-1af4db95f4df"
+  "success": false,
+  "message": "pending",
+  "url": null
 }
 ```
 
-## Poll task
+## Poll task (full)
 
 ```http
 GET /api/client/tasks/{task_id}
@@ -68,9 +72,8 @@ x-api-key: <plain_key>
 
 ```json
 {
-  "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "id": "42d72140-8613-4a53-a1df-1af4db95f4df",
   "status": "running",
-  "poll_url": "/api/client/tasks/42d72140-8613-4a53-a1df-1af4db95f4df",
   "profile_id": "PROFILE_ID",
   "target": "video",
   "prompt": "A cinematic shot of clouds moving fast over mountains",
@@ -86,8 +89,8 @@ x-api-key: <plain_key>
     "quality": "high",
     "duration": 5
   },
-  "result": null,
-  "error": null
+  "result_payload": null,
+  "error_message": null
 }
 ```
 
@@ -95,27 +98,16 @@ Success example:
 
 ```json
 {
-  "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "id": "42d72140-8613-4a53-a1df-1af4db95f4df",
   "status": "succeeded",
-  "poll_url": "/api/client/tasks/42d72140-8613-4a53-a1df-1af4db95f4df",
   "profile_id": "PROFILE_ID",
   "target": "image",
-  "prompt": "A cinematic portrait",
-  "negative_prompt": null,
-  "count": 1,
-  "provider_payload": {
-    "ratio": "1:1",
-    "quality": "high"
-  },
-  "result": {
-    "target": "image",
+  "result_payload": {
     "media_urls": [
-      "storage/profiles/PROFILE_ID/output/42d72140-8613-4a53-a1df-1af4db95f4df-image-1.jpg"
-    ],
-    "provider": "grok",
-    "page_url": "https://grok.com/imagine"
+      "https://flowgrok.plxeditor.com/storage/profiles/PROFILE_ID/output/42d72140-8613-4a53-a1df-1af4db95f4df-image-1.jpg"
+    ]
   },
-  "error": null
+  "error_message": null
 }
 ```
 
@@ -131,6 +123,31 @@ Poll alias:
 
 ```http
 GET /api/client/jobs/{task_id}
+```
+
+## Lite status (recommended for client)
+
+```http
+GET /api/client/tasks/{task_id}/status
+x-api-key: <plain_key>
+```
+
+Response:
+
+```json
+{
+  "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "status": "running",
+  "success": false,
+  "message": "running",
+  "url": null
+}
+```
+
+Legacy alias:
+
+```http
+GET /api/client/jobs/{task_id}/status
 ```
 
 ## Upload reference image
@@ -158,6 +175,7 @@ Response:
 ```
 
 Use `stored_path` in `reference_images`.
+If you pass `reference_images` as `http/https` URLs, backend will download and store them into `storage/profiles/{profile_id}/assets` automatically.
 
 ## Create API key
 
@@ -190,6 +208,50 @@ Launch live browser for login:
 POST /api/profiles/{profile_id}/launch-login
 ```
 
+Launch no-VNC runtime browser:
+
+```http
+POST /api/profiles/{profile_id}/launch-runtime
+Authorization: Bearer <admin_token>
+Content-Type: application/json
+```
+
+```json
+{
+  "display": ":101",
+  "start_url": "https://grok.com/"
+}
+```
+
+Runtime status:
+
+```http
+GET /api/profiles/{profile_id}/runtime-status
+Authorization: Bearer <admin_token>
+```
+
+Stop no-VNC runtime browser:
+
+```http
+POST /api/profiles/{profile_id}/stop-runtime
+Authorization: Bearer <admin_token>
+Content-Type: application/json
+```
+
+```json
+{
+  "display": ":101"
+}
+```
+
+Recommended admin flow:
+
+1. `launch-login` only when session is lost and manual login is needed.
+2. `launch-runtime` after login to keep the browser alive without VNC.
+3. `session-check` should return `authenticated`.
+4. Submit client/admin jobs while runtime browser is still alive.
+5. Use `runtime-status` to confirm CDP/debug port is open before blaming job failures on session state.
+
 ## Mapping rules
 
 - `target=image` and no `reference_images`: image generation.
@@ -215,6 +277,6 @@ POST /api/profiles/{profile_id}/launch-login
 
 ## Notes
 
-- `media_urls` are returned as relative storage paths.
+- `media_urls` are returned as full URLs (ready to download).
 - Video jobs can remain in `running` longer than image jobs.
 - Provider-specific behavior for `ratio`, `quality`, and `duration` depends on the live Grok automation flow.

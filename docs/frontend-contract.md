@@ -99,7 +99,9 @@ Header: `x-api-key: <plain_key>`
 
 - `POST /client/generate`
 - `GET /client/tasks/{task_id}`
+- `GET /client/tasks/{task_id}/status` (lite)
 - `GET /client/jobs/{task_id}` (legacy poll alias)
+- `GET /client/jobs/{task_id}/status` (legacy lite alias)
 - `POST /client/jobs` (legacy create alias)
 
 ```json
@@ -108,7 +110,7 @@ Header: `x-api-key: <plain_key>`
   "target": "video",
   "prompt": "a cinematic robot in Bangkok",
   "reference_images": [
-    "storage/profiles/uuid/assets/ref.png"
+    "https://images.example.com/ref.png"
   ],
   "ratio": "16:9",
   "quality": "high",
@@ -127,41 +129,46 @@ Header: `x-api-key: <plain_key>`
 - `target=video` and `reference_images` present: `video_mode=image_to_video`.
 - `ratio`, `quality`, and `duration` are accepted at top level and forwarded into `provider_payload`.
 - `profile_id` is optional. If omitted, backend auto-selects an active profile that is authenticated and allowed by the API key.
+- `reference_images` can be storage paths or `http/https` URLs (backend will download URLs into profile assets).
 
-### Generate response
+### Generate response (compact)
 
 ```json
 {
   "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
   "status": "pending",
-  "poll_url": "/api/client/tasks/42d72140-8613-4a53-a1df-1af4db95f4df"
+  "success": false,
+  "message": "pending",
+  "url": null
 }
 ```
 
-### Poll response
+### Poll response (full)
+
+```json
+{
+  "id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "status": "running",
+  "profile_id": "uuid",
+  "target": "video",
+  "result_payload": {
+    "media_urls": [
+      "https://flowgrok.plxeditor.com/storage/profiles/uuid/output/42d72140-8613-4a53-a1df-1af4db95f4df-video-1.mp4"
+    ]
+  },
+  "error_message": null
+}
+```
+
+### Lite status response (recommended)
 
 ```json
 {
   "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
   "status": "running",
-  "poll_url": "/api/client/tasks/42d72140-8613-4a53-a1df-1af4db95f4df",
-  "profile_id": "uuid",
-  "target": "video",
-  "prompt": "a cinematic robot in Bangkok",
-  "negative_prompt": "",
-  "count": 1,
-  "provider_payload": {
-    "reference_images": [
-      "storage/profiles/uuid/assets/ref.png"
-    ],
-    "source_asset_path": "storage/profiles/uuid/assets/ref.png",
-    "video_mode": "image_to_video",
-    "ratio": "16:9",
-    "quality": "high",
-    "duration": 5
-  },
-  "result": null,
-  "error": null
+  "success": false,
+  "message": "running",
+  "url": null
 }
 ```
 
@@ -169,8 +176,8 @@ Header: `x-api-key: <plain_key>`
 
 - `pending`: task has been accepted and queued.
 - `running`: worker is currently automating the live Grok session.
-- `succeeded`: `result.media_urls` is available.
-- `failed`: task stopped and `error` contains the reason.
+- `succeeded`: `result_payload.media_urls` is available.
+- `failed`: task stopped and `error_message` contains the reason.
 
 Common error cases:
 

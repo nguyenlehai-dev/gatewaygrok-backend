@@ -1,0 +1,1640 @@
+{
+  "info": {
+    "_postman_id": "8d7d8a1d-6dd5-4c07-a7f6-8d49d5d8b8f1",
+    "name": "GatewayGrok Test",
+    "description": "Postman collection for GatewayGrok test environment at testflowgrok.plxeditor.com",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://192.168.100.67:18084"
+    },
+    {
+      "key": "admin_username",
+      "value": "admin_test"
+    },
+    {
+      "key": "admin_password",
+      "value": "change-me-test"
+    },
+    {
+      "key": "admin_token",
+      "value": ""
+    },
+    {
+      "key": "client_api_key",
+      "value": "gg_k1sB2HLzCApkvFN1z6ycBaW8xaZelP_Y"
+    },
+    {
+      "key": "profile_id_1",
+      "value": "d5a1ef00-a053-4ca4-8ed8-58429b396a1a"
+    },
+    {
+      "key": "profile_id_2",
+      "value": "dda2bb75-52ad-4a30-bda0-2f3082ef49c1"
+    },
+    {
+      "key": "profile_id_3",
+      "value": "e6980c8f-3d4b-4e0b-b70b-8f23e1872c26"
+    },
+    {
+      "key": "job_id",
+      "value": ""
+    },
+    {
+      "key": "source_asset_path",
+      "value": "storage-test/profiles/{{profile_id_3}}/output/45323974-6543-4b5e-834a-cd4d589be27f-image-1.jpg"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Admin Login",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.access_token) {",
+              "  pm.collectionVariables.set('admin_token', data.access_token);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"username\": \"{{admin_username}}\",\n  \"password\": \"{{admin_password}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/auth/login",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "auth",
+            "login"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Auth Bootstrap",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/auth/bootstrap",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "auth",
+            "bootstrap"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Meta",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/meta",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "meta"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Overview",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/overview",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "overview"
+          ]
+        }
+      }
+    },
+    {
+      "name": "List Profiles",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Profile 1",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Profile",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"grok-test-new\",\n  \"category\": \"grok\",\n  \"description\": \"New test profile\",\n  \"tags\": [\"test\", \"grok\"],\n  \"concurrency_limit\": 1,\n  \"antidetect\": {\n    \"locale\": \"en-US\",\n    \"timezone_id\": \"UTC\",\n    \"viewport_width\": 1440,\n    \"viewport_height\": 900,\n    \"platform\": \"Win32\",\n    \"hardware_concurrency\": 8\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Update Profile 1",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"description\": \"Updated from Postman\",\n  \"tags\": [\"test\", \"grok\", \"postman\"],\n  \"concurrency_limit\": 1\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Import Cookies Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/cookies",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "cookies"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Import Cookies Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/cookies",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "cookies"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Import Cookies Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/cookies",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "cookies"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Upload Asset Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/assets",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "assets"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Session Check Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/session-check",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "session-check"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Session Check Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/session-check",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "session-check"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Session Check Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/session-check",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "session-check"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Login Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/launch-login",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "launch-login"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Login Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/launch-login",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "launch-login"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Login Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/launch-login",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "launch-login"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Runtime Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":101\",\n  \"start_url\": \"https://grok.com/imagine\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/launch-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "launch-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Runtime Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":102\",\n  \"start_url\": \"https://grok.com/imagine\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/launch-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "launch-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Launch Runtime Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":103\",\n  \"start_url\": \"https://grok.com/imagine\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/launch-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "launch-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Runtime Status Profile 1",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/runtime-status",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "runtime-status"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Runtime Status Profile 2",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/runtime-status",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "runtime-status"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Runtime Status Profile 3",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/runtime-status",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "runtime-status"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Stop Runtime Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":101\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_1}}/stop-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_1}}",
+            "stop-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Stop Runtime Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":102\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_2}}/stop-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_2}}",
+            "stop-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Stop Runtime Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"display\": \":103\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/profiles/{{profile_id_3}}/stop-runtime",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "profiles",
+            "{{profile_id_3}}",
+            "stop-runtime"
+          ]
+        }
+      }
+    },
+    {
+      "name": "List Proxies",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/proxies",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "proxies"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Proxy",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"proxy-test-01\",\n  \"kind\": \"http\",\n  \"server\": \"127.0.0.1\",\n  \"port\": 8080,\n  \"username\": null,\n  \"password\": null,\n  \"enabled\": true\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/proxies",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "proxies"
+          ]
+        }
+      }
+    },
+    {
+      "name": "List API Keys",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/api-keys",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "api-keys"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create API Key",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"postman-created-key\",\n  \"rate_limit_per_minute\": 60,\n  \"allowed_categories\": [\"grok\"],\n  \"notes\": \"Created from Postman\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/api-keys",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "api-keys"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Settings",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/settings",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "settings"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Update Settings",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"automation\": {\n    \"concurrency\": 2,\n    \"timeout_ms\": 120000,\n    \"headless\": true\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/settings",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "settings"
+          ]
+        }
+      }
+    },
+    {
+      "name": "List Admin Jobs",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "jobs"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Admin Job Profile 1",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_1}}\",\n  \"target\": \"image\",\n  \"prompt\": \"admin job test prompt\",\n  \"count\": 1,\n  \"provider_payload\": {}\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "jobs"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Admin Job By ID",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/jobs/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "jobs",
+            "{{job_id}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Retry Admin Job By ID",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/jobs/{{job_id}}/retry",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "jobs",
+            "{{job_id}}",
+            "retry"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Delete Admin Job By ID",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/jobs/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "jobs",
+            "{{job_id}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Verify Client API Key",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/client/verify",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "verify"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Image Job Profile 1",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_1}}\",\n  \"target\": \"image\",\n  \"prompt\": \"simple test prompt\",\n  \"count\": 1\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Video Job Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_1}}\",\n  \"target\": \"video\",\n  \"prompt\": \"simple test video prompt\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"duration\": 5,\n    \"quality\": \"standard\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Text-to-Video Job Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_1}}\",\n  \"target\": \"video\",\n  \"prompt\": \"cinematic slow motion shot of a matte black perfume bottle on black obsidian stone, subtle smoke, studio light, 5 seconds\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"text_to_video\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Image-to-Video Job Profile 1",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_1}}\",\n  \"target\": \"video\",\n  \"prompt\": \"slow cinematic camera push-in, subtle smoke drifting around the bottle, luxury commercial style\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"image_to_video\",\n    \"source_asset_path\": \"{{source_asset_path}}\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Image Job Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_2}}\",\n  \"target\": \"image\",\n  \"prompt\": \"minimal product photo of a matte black perfume bottle on black obsidian stone, dramatic studio lighting\",\n  \"count\": 1\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Text-to-Video Job Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_2}}\",\n  \"target\": \"video\",\n  \"prompt\": \"cinematic slow motion shot of a matte black perfume bottle on black obsidian stone, subtle smoke, studio light, 5 seconds\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"text_to_video\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Image-to-Video Job Profile 2",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_2}}\",\n  \"target\": \"video\",\n  \"prompt\": \"slow cinematic camera push-in, subtle smoke drifting around the bottle, luxury commercial style\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"image_to_video\",\n    \"source_asset_path\": \"{{source_asset_path}}\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Image Job Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_3}}\",\n  \"target\": \"image\",\n  \"prompt\": \"minimal product photo of a matte black perfume bottle on black obsidian stone, dramatic studio lighting\",\n  \"count\": 1\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Text-to-Video Job Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_3}}\",\n  \"target\": \"video\",\n  \"prompt\": \"cinematic slow motion shot of a matte black perfume bottle on black obsidian stone, subtle smoke, studio light, 5 seconds\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"text_to_video\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create Image-to-Video Job Profile 3",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"profile_id\": \"{{profile_id_3}}\",\n  \"target\": \"video\",\n  \"prompt\": \"slow cinematic camera push-in, subtle smoke drifting around the bottle, luxury commercial style\",\n  \"count\": 1,\n  \"provider_payload\": {\n    \"video_mode\": \"image_to_video\",\n    \"source_asset_path\": \"{{source_asset_path}}\",\n    \"duration\": 5,\n    \"quality\": \"Speed\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const data = pm.response.json();",
+              "if (data.id) {",
+              "  pm.collectionVariables.set('job_id', data.id);",
+              "} else if (data.task_id) {",
+              "  pm.collectionVariables.set('job_id', data.task_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get Job By ID",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs/{{job_id}}",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs",
+            "{{job_id}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Job Status By ID",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "x-api-key",
+            "value": "{{client_api_key}}"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/client/jobs/{{job_id}}/status",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "client",
+            "jobs",
+            "{{job_id}}",
+            "status"
+          ]
+        }
+      }
+    }
+  ]
+}
