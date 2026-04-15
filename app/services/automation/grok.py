@@ -4,7 +4,7 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.async_api import Page
+from playwright.async_api import Page, Response
 
 from app.models.automation_job import AutomationJob
 from app.models.profile import Profile
@@ -39,6 +39,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
     def _normalize_option_text(self, value: str) -> str:
         lowered = value.strip().lower()
         return re.sub(r"[^a-z0-9]+", "", lowered)
+
+    def _is_generated_image_url(self, url: str) -> bool:
+        normalized = (url or "").strip().lower()
+        if not normalized.startswith(("http://", "https://")):
+            return False
+        if "imagine-public.x.ai/imagine-public/share-videos/" in normalized:
+            return False
+        if "_thumbnail." in normalized:
+            return False
+        return "imagine-public.x.ai/imagine-public/share-images/" in normalized or "/generated/" in normalized
 
     def _composer_script(self, action: str) -> str:
         return f"""
@@ -364,7 +374,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 f"Prompt was not accepted by Grok editor. current='{current[:120]}' submit_enabled={enabled}"
             )
 
-    async def _submit_from_editor(self, page: Page, selectors: list[str]) -> None:
+    async def _submit_from_editor(
+        self,
+        page: Page,
+        selectors: list[str],
+        *,
+        accept_cleared_prompt_without_page_change: bool = False,
+    ) -> None:
         with suppress(Exception):
             await page.bring_to_front()
         before = await self._body_marker(page)
@@ -381,7 +397,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     if (
                         after_url != before_url
                         or (after_marker and after_marker != before)
-                        or await self._prompt_cleared_after_submit(page, before_text)
+                        or (
+                            accept_cleared_prompt_without_page_change
+                            and await self._prompt_cleared_after_submit(page, before_text)
+                        )
                     ):
                         return
 
@@ -405,7 +424,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         if (
                             after_url != before_url
                             or (after_marker and after_marker != before)
-                            or await self._prompt_cleared_after_submit(page, before_text)
+                            or (
+                                accept_cleared_prompt_without_page_change
+                                and await self._prompt_cleared_after_submit(page, before_text)
+                            )
                         ):
                             return
 
@@ -416,7 +438,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if (
                     page.url != before_url
                     or (after_enter and after_enter != before)
-                    or await self._prompt_cleared_after_submit(page, before_text)
+                    or (
+                        accept_cleared_prompt_without_page_change
+                        and await self._prompt_cleared_after_submit(page, before_text)
+                    )
                 ):
                     return
 
@@ -1012,6 +1037,51 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         return best_complete
 
+    async def _wait_for_new_image_media(
+        self,
+        page: Page,
+        existing_media: list[str],
+        *,
+        attempts: int = 45,
+        delay_ms: int = 4000,
+    ) -> list[str]:
+        seen = {item.strip() for item in existing_media if item and item.strip()}
+        best_complete: list[str] = []
+        for _ in range(attempts):
+            latest = self._normalize_media_urls(await self._extract_media_urls(page, "image"), "image")
+            fresh = [item for item in latest if item not in seen]
+            if fresh:
+                if len(fresh) >= len(best_complete):
+                    best_complete = fresh
+                return fresh
+            if latest and len(latest) > len(best_complete):
+                best_complete = latest
+            await page.wait_for_timeout(delay_ms)
+        return best_complete
+
+    async def _wait_for_observed_image_responses(
+        self,
+        observed_urls: list[str],
+        existing_media: list[str],
+        *,
+        attempts: int = 60,
+        delay_ms: int = 4000,
+    ) -> list[str]:
+        seen = {item.strip() for item in existing_media if item and item.strip()}
+        for _ in range(attempts):
+            fresh: list[str] = []
+            dedup: set[str] = set()
+            for item in observed_urls:
+                normalized = item.strip()
+                if not normalized or normalized in seen or normalized in dedup:
+                    continue
+                dedup.add(normalized)
+                fresh.append(normalized)
+            if fresh:
+                return fresh[:4]
+            await asyncio.sleep(delay_ms / 1000)
+        return []
+
     async def _download_remote_media(self, page: Page, url: str, target_path: Path) -> str:
         payload = await page.evaluate(
             """
@@ -1233,6 +1303,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "button:has-text('Generate')",
                 "button:has-text('Create video')",
             ],
+            accept_cleared_prompt_without_page_change=True,
         )
         try:
             await page.wait_for_url("**/imagine/post/**", timeout=20000)
@@ -1291,6 +1362,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "button:has-text('Create image')",
                 "button:has-text('Generate')",
             ],
+            accept_cleared_prompt_without_page_change=True,
         )
         return applied_options
 
@@ -1456,8 +1528,23 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         )
                     raise
 
-        image_page = await self._open_isolated_imagine_page(page)
+        image_page = page
+        with suppress(Exception):
+            await image_page.bring_to_front()
+        observed_image_urls: list[str] = []
+
+        async def _observe_image_response(response: Response) -> None:
+            url = response.url
+            if response.status != 200 or not self._is_generated_image_url(url):
+                return
+            observed_image_urls.append(url)
+
         try:
+            existing_image_media = self._normalize_media_urls(
+                await self._extract_media_urls(image_page, "image"),
+                "image",
+            )
+            image_page.on("response", _observe_image_response)
             applied_options = await self._open_imagine_image_flow(
                 image_page,
                 job.prompt,
@@ -1466,15 +1553,23 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 quality=str(quality) if quality else None,
             )
 
-            media_urls = await self._wait_for_filtered_media(
-                image_page,
-                job.target.value,
-                attempts=45,
+            media_urls = await self._wait_for_observed_image_responses(
+                observed_image_urls,
+                existing_image_media,
+                attempts=60,
                 delay_ms=4000,
             )
+            if not media_urls:
+                media_urls = await self._wait_for_new_image_media(
+                    image_page,
+                    existing_image_media,
+                    attempts=60,
+                    delay_ms=4000,
+                )
+            media_urls = self._normalize_media_urls(media_urls, "image")
             media_urls = await self._localize_image_media(image_page, profile, job, media_urls)
             if not media_urls:
-                media_urls = await self._capture_image_panel_fallback(image_page, profile, job)
+                raise RuntimeError("No fresh generated image media detected after submit")
             return {
                 "target": job.target.value,
                 "source_asset_path": source_asset_path,
@@ -1483,7 +1578,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "applied_options": applied_options,
                 "media_urls": media_urls,
                 "_result_page": image_page,
-                "_close_pages": [image_page],
+                "_close_pages": [],
             }
         except Exception:
             with suppress(Exception):
@@ -1492,6 +1587,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     full_page=True,
                 )
             raise
+        finally:
+            with suppress(Exception):
+                image_page.remove_listener("response", _observe_image_response)
 
 
 grok_provider = GrokAutomationProvider()
