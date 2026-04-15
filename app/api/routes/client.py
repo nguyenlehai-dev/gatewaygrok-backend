@@ -146,11 +146,12 @@ def _lite_payload(job: AutomationJob, request: Request) -> dict:
             if isinstance(item, str) and item:
                 url = _absolute_url(request, item)
                 break
-    success = payload.get("status") == "succeeded"
+    status = payload.get("status")
+    success = True if status == "succeeded" else False if status == "failed" else None
     message = payload.get("error_message") or payload.get("status")
     return {
         "task_id": payload.get("id"),
-        "status": payload.get("status"),
+        "status": status,
         "success": success,
         "message": message,
         "url": url,

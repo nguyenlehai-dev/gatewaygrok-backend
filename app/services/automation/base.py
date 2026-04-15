@@ -60,15 +60,28 @@ class BaseAutomationProvider(ABC):
         *,
         prefer_live_browser: bool = False,
     ) -> tuple[BrowserContext, object, bool, Browser | None]:
-        if prefer_live_browser and is_debug_port_open(profile.id):
-            try:
-                playwright = await async_playwright().start()
-                browser = await playwright.chromium.connect_over_cdp(debug_endpoint_for_profile(profile.id))
-                context = browser.contexts[0] if browser.contexts else await browser.new_context()
-                return context, playwright, True, browser
-            except Exception:  # noqa: BLE001
-                with suppress(Exception):
-                    await playwright.stop()
+        if prefer_live_browser:
+            live_endpoint = debug_endpoint_for_profile(profile.id)
+            last_live_exc: Exception | None = None
+            for _ in range(8):
+                if not is_debug_port_open(profile.id):
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    playwright = await async_playwright().start()
+                    browser = await playwright.chromium.connect_over_cdp(live_endpoint)
+                    context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                    return context, playwright, True, browser
+                except Exception as exc:  # noqa: BLE001
+                    last_live_exc = exc
+                    with suppress(Exception):
+                        await playwright.stop()
+                    await asyncio.sleep(1)
+            live_exc = last_live_exc or RuntimeError(
+                f"Live browser CDP is not available for profile {profile.id} at {live_endpoint}"
+            )
+            if not self._should_retry_without_live_browser(live_exc):
+                raise live_exc
 
         playwright = await async_playwright().start()
         antidetect = profile.antidetect or {}
@@ -505,6 +518,8 @@ class BaseAutomationProvider(ABC):
             prefer_live_browser=prefer_live_browser,
         )
         page: Page | None = None
+        result_page: Page | None = None
+        additional_pages_to_close: list[Page] = []
         created_fresh_page = False
         try:
             page, created_fresh_page = await self._resolve_page(context, automation_settings.timeout_ms)
@@ -514,14 +529,30 @@ class BaseAutomationProvider(ABC):
                 with suppress(Exception):
                     await page.wait_for_load_state("domcontentloaded", timeout=automation_settings.timeout_ms)
             result = await self.perform(page, profile, job, automation_settings)
-            screenshot = await self._capture_debug(page, profile_storage.output_dir(profile.id), f"{job.id}-final")
+            custom_result_page = result.pop("_result_page", None)
+            custom_close_pages = result.pop("_close_pages", None)
+            if isinstance(custom_result_page, Page):
+                result_page = custom_result_page
+            if isinstance(custom_close_pages, list):
+                additional_pages_to_close = [item for item in custom_close_pages if isinstance(item, Page)]
+            debug_page = result_page or page
+            screenshot = await self._capture_debug(
+                debug_page,
+                profile_storage.output_dir(profile.id),
+                f"{job.id}-final",
+            )
             result["provider"] = self.provider_name
             result["start_url"] = self.start_url
-            result["page_url"] = page.url
+            result["page_url"] = debug_page.url
             result["debug_screenshot"] = screenshot
             result["used_live_browser"] = connected_live_browser
             return result
         finally:
+            for extra_page in additional_pages_to_close:
+                if page is not None and extra_page == page:
+                    continue
+                with suppress(Exception):
+                    await extra_page.close()
             if page is not None and (created_fresh_page or not connected_live_browser):
                 with suppress(Exception):
                     await page.close()

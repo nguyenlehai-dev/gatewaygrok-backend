@@ -105,12 +105,13 @@ class JobRunner:
                 db.commit()
                 return
 
-            job.status = JobStatus.RUNNING
-            db.commit()
-
             async with semaphore:
+                job.status = JobStatus.RUNNING
+                db.commit()
                 try:
                     timeout_seconds = max(120, int(automation_settings.timeout_ms / 1000) * 2)
+                    if job.target.value == "video":
+                        timeout_seconds = max(timeout_seconds, 600)
                     result = await asyncio.wait_for(
                         provider.run(profile, profile.proxy, job, automation_settings),
                         timeout=timeout_seconds,
@@ -125,7 +126,7 @@ class JobRunner:
                     job.error_message = f"Automation timed out after {timeout_seconds}s"
                 except Exception as exc:  # noqa: BLE001
                     job.status = JobStatus.FAILED
-                    job.error_message = str(exc)
+                    job.error_message = str(exc) or exc.__class__.__name__
                 db.add(job)
                 db.commit()
 

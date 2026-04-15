@@ -17,26 +17,408 @@ class GrokAutomationProvider(BaseAutomationProvider):
     provider_name = "grok"
     start_url = "https://grok.com/"
 
+    def _should_retry_without_live_browser(self, exc: Exception) -> bool:
+        del exc
+        # Grok staging is intentionally operated in no-VNC/CDP mode. Falling back
+        # to an isolated headless browser hides the real session state and causes
+        # long-running jobs that are impossible to inspect from the live profile.
+        return False
+
+    async def _open_isolated_imagine_page(self, page: Page) -> Page:
+        isolated_page = await page.context.new_page()
+        isolated_page.set_default_timeout(60000)
+        await isolated_page.bring_to_front()
+        await isolated_page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+        await isolated_page.wait_for_timeout(1500)
+        await isolated_page.bring_to_front()
+        return isolated_page
+
+    async def _open_isolated_video_page(self, page: Page) -> Page:
+        return await self._open_isolated_imagine_page(page)
+
+    def _normalize_option_text(self, value: str) -> str:
+        lowered = value.strip().lower()
+        return re.sub(r"[^a-z0-9]+", "", lowered)
+
+    def _composer_script(self, action: str) -> str:
+        return f"""
+        (value) => {{
+          const isVisible = (node) => {{
+            if (!node) {{
+              return false;
+            }}
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.bottom > 0 &&
+              rect.right > 0 &&
+              style.visibility !== "hidden" &&
+              style.display !== "none"
+            );
+          }};
+          const visibleEditors = Array.from(document.querySelectorAll(
+            "[contenteditable='true'], div[contenteditable='true'], [role='textbox'], textarea, p[data-placeholder='Type to imagine']"
+          ))
+            .filter(isVisible)
+            .sort((left, right) => {{
+              const leftRect = left.getBoundingClientRect();
+              const rightRect = right.getBoundingClientRect();
+              return leftRect.y - rightRect.y || leftRect.x - rightRect.x;
+            }});
+          const editor = visibleEditors.at(-1);
+          if (!editor) {{
+            return {{ ok: false, text: "", enabled: false }};
+          }}
+
+          const visibleSubmitButtons = Array.from(document.querySelectorAll("button[aria-label='Submit'], button[type='submit']"))
+            .filter(isVisible)
+            .sort((left, right) => {{
+              const leftRect = left.getBoundingClientRect();
+              const rightRect = right.getBoundingClientRect();
+              return leftRect.y - rightRect.y || leftRect.x - rightRect.x;
+            }});
+          const submit = visibleSubmitButtons.at(-1) || null;
+          const isEnabled = submit
+            ? !submit.hasAttribute("disabled") && submit.getAttribute("aria-disabled") !== "true"
+            : false;
+          const readText = () => (editor.innerText || editor.textContent || editor.value || "").replace(/\\s+/g, " ").trim();
+
+          if ("{action}" === "fill") {{
+            editor.scrollIntoView({{ block: "center", inline: "center" }});
+            editor.focus();
+            if (editor.tagName === "TEXTAREA" || editor.tagName === "INPUT") {{
+              editor.value = value;
+              editor.dispatchEvent(new Event("input", {{ bubbles: true }}));
+              editor.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            }} else {{
+              editor.innerHTML = "";
+              editor.textContent = value;
+              editor.dispatchEvent(new InputEvent("beforeinput", {{
+                inputType: "insertText",
+                data: value,
+                bubbles: true,
+                cancelable: true,
+              }}));
+              editor.dispatchEvent(new InputEvent("input", {{
+                inputType: "insertText",
+                data: value,
+                bubbles: true,
+              }}));
+              editor.dispatchEvent(new Event("change", {{ bubbles: true }}));
+            }}
+          }}
+
+          return {{ ok: true, text: readText(), enabled: isEnabled }};
+        }}
+        """
+
     async def _body_marker(self, page: Page) -> str:
         with suppress(Exception):
             preview = await self._body_preview(page)
             return " ".join(preview.split()).lower()
         return ""
 
+    async def _editor_text(self, page: Page) -> str:
+        with suppress(Exception):
+            state = await page.evaluate(self._composer_script("read"), "")
+            if isinstance(state, dict):
+                return str(state.get("text") or "")
+        return ""
+
+    async def _submit_enabled(self, page: Page) -> bool:
+        with suppress(Exception):
+            state = await page.evaluate(self._composer_script("read"), "")
+            if isinstance(state, dict):
+                return bool(state.get("enabled"))
+        return False
+
+    async def _prompt_cleared_after_submit(self, page: Page, before_text: str) -> bool:
+        return bool(before_text.strip()) and not bool((await self._editor_text(page)).strip())
+
+    async def _click_enabled_submit_dom(self, page: Page) -> bool:
+        with suppress(Exception):
+            return await page.evaluate(
+                """
+                () => {
+                  const buttons = Array.from(document.querySelectorAll("button[aria-label='Submit'], button[type='submit']"));
+                  const candidates = buttons.filter((button) => {
+                    const rect = button.getBoundingClientRect();
+                    const style = window.getComputedStyle(button);
+                    return (
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.visibility !== "hidden" &&
+                      style.display !== "none" &&
+                      !button.hasAttribute("disabled") &&
+                      button.getAttribute("aria-disabled") !== "true"
+                    );
+                  });
+                  const button = candidates.at(-1);
+                  if (!button) {
+                    return false;
+                  }
+                  button.scrollIntoView({ block: "center", inline: "center" });
+                  for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+                    button.dispatchEvent(new MouseEvent(eventName, {
+                      bubbles: true,
+                      cancelable: true,
+                      view: window,
+                    }));
+                  }
+                  button.click();
+                  return true;
+                }
+                """
+            )
+        return False
+
+    async def _focus_bottom_composer(self, page: Page) -> bool:
+        with suppress(Exception):
+            return await page.evaluate(
+                """
+                () => {
+                  const isVisible = (node) => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return (
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.visibility !== "hidden" &&
+                      style.display !== "none"
+                    );
+                  };
+                  const editors = Array.from(document.querySelectorAll(
+                    "div.ProseMirror[contenteditable='true'], [contenteditable='true'], div[contenteditable='true'], [role='textbox'], textarea"
+                  ))
+                    .filter(isVisible)
+                    .sort((left, right) => {
+                      const leftRect = left.getBoundingClientRect();
+                      const rightRect = right.getBoundingClientRect();
+                      return leftRect.y - rightRect.y || leftRect.x - rightRect.x;
+                    });
+                  const editor = editors.at(-1);
+                  if (!editor) {
+                    return false;
+                  }
+                  editor.scrollIntoView({ block: "center", inline: "center" });
+                  editor.focus();
+                  return true;
+                }
+                """
+            )
+        return False
+
+    async def _bottom_composer_rect(self, page: Page) -> dict | None:
+        with suppress(Exception):
+            rect = await page.evaluate(
+                """
+                () => {
+                  const isVisible = (node) => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return (
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.visibility !== "hidden" &&
+                      style.display !== "none"
+                    );
+                  };
+                  const editors = Array.from(document.querySelectorAll(
+                    "div.ProseMirror[contenteditable='true'], [contenteditable='true'], div[contenteditable='true'], [role='textbox'], textarea"
+                  ))
+                    .filter(isVisible)
+                    .sort((left, right) => {
+                      const leftRect = left.getBoundingClientRect();
+                      const rightRect = right.getBoundingClientRect();
+                      return leftRect.y - rightRect.y || leftRect.x - rightRect.x;
+                    });
+                  const editor = editors.at(-1);
+                  if (!editor) {
+                    return null;
+                  }
+                  const box = editor.getBoundingClientRect();
+                  return {
+                    x: box.x,
+                    y: box.y,
+                    width: box.width,
+                    height: box.height,
+                  };
+                }
+                """
+            )
+            if isinstance(rect, dict):
+                return rect
+        return None
+
+    async def _force_refill_prompt(self, page: Page, prompt: str) -> None:
+        with suppress(Exception):
+            await page.bring_to_front()
+        rect = await self._bottom_composer_rect(page)
+        if rect:
+            x = float(rect.get("x", 0)) + min(40, max(1, float(rect.get("width", 1)) / 2))
+            y = float(rect.get("y", 0)) + max(1, float(rect.get("height", 1)) / 2)
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(150)
+            with suppress(Exception):
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(prompt)
+            await page.wait_for_timeout(700)
+            if await self._editor_text(page):
+                return
+
+        if await self._focus_bottom_composer(page):
+            with suppress(Exception):
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(prompt)
+            await page.wait_for_timeout(700)
+            if await self._editor_text(page):
+                return
+
+        with suppress(Exception):
+            ok = await page.evaluate(
+                """
+                (text) => {
+                  const isVisible = (node) => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return (
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.visibility !== "hidden" &&
+                      style.display !== "none"
+                    );
+                  };
+                  const editors = Array.from(document.querySelectorAll(
+                    "div.ProseMirror[contenteditable='true'], [contenteditable='true'], div[contenteditable='true'], [role='textbox'], textarea"
+                  ))
+                    .filter(isVisible)
+                    .sort((left, right) => {
+                      const leftRect = left.getBoundingClientRect();
+                      const rightRect = right.getBoundingClientRect();
+                      return leftRect.y - rightRect.y || leftRect.x - rightRect.x;
+                    });
+                  const editor = editors.at(-1);
+                  if (!editor) {
+                    return false;
+                  }
+                  editor.focus();
+                  document.execCommand("selectAll", false, null);
+                  document.execCommand("insertText", false, text);
+                  return true;
+                }
+                """,
+                prompt,
+            )
+            if ok:
+                await page.wait_for_timeout(700)
+                if await self._editor_text(page):
+                    return
+
+        editor = await self._first_visible(
+            page,
+            [
+                "[role='textbox']",
+                "div[role='textbox']",
+                "[contenteditable='true']",
+                "div[contenteditable='true']",
+                "p[data-placeholder='Type to imagine']",
+                "textarea",
+            ],
+        )
+        await editor.click()
+        with suppress(Exception):
+            await page.keyboard.press("Control+A")
+        await page.keyboard.insert_text(prompt)
+        await page.wait_for_timeout(600)
+
+    async def _ensure_prompt_ready_for_submit(self, page: Page, prompt: str) -> None:
+        expected = " ".join(prompt.split()).strip()
+        for _ in range(3):
+            current = await self._editor_text(page)
+            enabled = await self._submit_enabled(page)
+            if current == expected and enabled:
+                return
+            await self._force_refill_prompt(page, prompt)
+            with suppress(Exception):
+                await page.keyboard.press("End")
+                await page.keyboard.type(" ")
+                await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(500)
+
+        current = await self._editor_text(page)
+        enabled = await self._submit_enabled(page)
+        if current != expected or not enabled:
+            raise RuntimeError(
+                f"Prompt was not accepted by Grok editor. current='{current[:120]}' submit_enabled={enabled}"
+            )
+
     async def _submit_from_editor(self, page: Page, selectors: list[str]) -> None:
+        with suppress(Exception):
+            await page.bring_to_front()
         before = await self._body_marker(page)
+        before_url = page.url
 
-        with suppress(Exception):
-            await self._submit_generation(page, selectors)
-            return
+        for _ in range(3):
+            before_text = await self._editor_text(page)
+            with suppress(Exception):
+                clicked = await self._click_enabled_submit_dom(page)
+                if clicked:
+                    await page.wait_for_timeout(2000)
+                    after_url = page.url
+                    after_marker = await self._body_marker(page)
+                    if (
+                        after_url != before_url
+                        or (after_marker and after_marker != before)
+                        or await self._prompt_cleared_after_submit(page, before_text)
+                    ):
+                        return
 
-        with suppress(Exception):
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(1500)
+            submit = await self._first_visible(page, selectors, raise_on_empty=False)
+            if submit:
+                with suppress(Exception):
+                    await submit.wait_for(state="visible", timeout=2000)
+                disabled = None
+                aria_disabled = None
+                is_enabled = True
+                with suppress(Exception):
+                    disabled = await submit.get_attribute("disabled")
+                    aria_disabled = await submit.get_attribute("aria-disabled")
+                    is_enabled = await submit.is_enabled()
+                if disabled is None and aria_disabled not in {"true", "True"} and is_enabled:
+                    with suppress(Exception):
+                        await submit.click(timeout=5000, force=True)
+                        await page.wait_for_timeout(2000)
+                        after_url = page.url
+                        after_marker = await self._body_marker(page)
+                        if (
+                            after_url != before_url
+                            or (after_marker and after_marker != before)
+                            or await self._prompt_cleared_after_submit(page, before_text)
+                        ):
+                            return
 
-        after_enter = await self._body_marker(page)
-        if after_enter and after_enter != before:
-            return
+            with suppress(Exception):
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(1500)
+                after_enter = await self._body_marker(page)
+                if (
+                    page.url != before_url
+                    or (after_enter and after_enter != before)
+                    or await self._prompt_cleared_after_submit(page, before_text)
+                ):
+                    return
 
         await self._submit_generation(page, selectors)
 
@@ -254,9 +636,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 });
               };
 
-              for (const node of Array.from(document.querySelectorAll('img, div, button, a, section, article'))) {
+              for (const node of Array.from(document.querySelectorAll('img, video, canvas, div, button, a, section, article'))) {
                 const rect = node.getBoundingClientRect();
-                if (rect.width < 240 || rect.height < 240 || rect.bottom <= 0 || rect.right <= 0) {
+                if (rect.width < 220 || rect.height < 130 || rect.bottom <= 0 || rect.right <= 0) {
                   continue;
                 }
                 const style = window.getComputedStyle(node);
@@ -266,7 +648,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
                 const src = node.currentSrc || node.src || '';
                 const bg = style.backgroundImage || '';
+                const isMediaNode = ['IMG', 'VIDEO', 'CANVAS'].includes(node.tagName);
                 const hasMedia =
+                  isMediaNode ||
                   src.startsWith('data:image/') ||
                   src.startsWith('blob:') ||
                   src.startsWith('http://') ||
@@ -277,7 +661,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                   continue;
                 }
 
-                const score = Math.round((rect.width * rect.height) / 1000);
+                let score = Math.round((rect.width * rect.height) / 1000);
+                if (isMediaNode) {
+                  score += 300;
+                }
+                if (rect.y < window.innerHeight * 0.75) {
+                  score += 120;
+                }
                 pushItem(rect, score);
               }
 
@@ -370,7 +760,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         return False
 
     async def _click_exact_option(self, page: Page, values: list[str]) -> bool:
-        normalized_values = {value.strip().lower() for value in values if value and value.strip()}
+        normalized_values = {self._normalize_option_text(value) for value in values if value and value.strip()}
         if not normalized_values:
             return False
 
@@ -399,8 +789,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 except Exception:  # noqa: BLE001
                     continue
 
-                normalized_text = re.sub(r"\s+", " ", text).strip().lower()
-                if normalized_text not in normalized_values:
+                normalized_text = self._normalize_option_text(text)
+                if normalized_text not in normalized_values and not any(
+                    value and (value in normalized_text or normalized_text in value)
+                    for value in normalized_values
+                ):
                     continue
 
                 try:
@@ -476,6 +869,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 [
                     f"button[aria-label*='{label}' i]",
                     f"[aria-label*='{label}' i] button",
+                    f"[role='combobox'][aria-label*='{label}' i]",
+                    f"[data-state] button:has-text('{label}')",
                     f"button:has-text('{label}')",
                     f"label:has-text('{label}')",
                     f"[role='button']:has-text('{label}')",
@@ -500,6 +895,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         ratio: str | None = None,
         quality: str | None = None,
         duration: int | str | None = None,
+        video_mode: bool = False,
     ) -> dict:
         applied: dict[str, str | int] = {}
 
@@ -507,46 +903,66 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ratio_value = str(ratio).strip()
             ratio_candidates = [ratio_value]
             ratio_aliases = {
-                "1:1": ["1x1", "square"],
-                "9:16": ["9x16", "portrait", "vertical"],
-                "16:9": ["16x9", "landscape", "horizontal"],
-                "3:4": ["3x4", "portrait"],
-                "4:3": ["4x3", "classic"],
-                "2:3": ["2x3", "portrait"],
-                "3:2": ["3x2", "landscape"],
+                "1:1": ["1x1", "square", "square 1:1"],
+                "9:16": ["9x16", "portrait", "vertical", "portrait 9:16", "vertical 9:16"],
+                "16:9": ["16x9", "landscape", "horizontal", "landscape 16:9", "wide 16:9"],
+                "3:4": ["3x4", "portrait", "portrait 3:4"],
+                "4:3": ["4x3", "classic", "landscape 4:3"],
+                "2:3": ["2x3", "portrait", "portrait 2:3"],
+                "3:2": ["3x2", "landscape", "landscape 3:2"],
             }
             ratio_candidates.extend(ratio_aliases.get(ratio_value, []))
             if await self._try_click_matching_option(page, ratio_candidates):
                 applied["ratio"] = ratio_value
-            elif await self._try_open_dropdown(page, ["Aspect ratio", "Ratio"]):
+            elif await self._try_open_dropdown(page, ["Aspect ratio", "Aspect", "Ratio", "Format", "Size"]):
                 await page.wait_for_timeout(400)
                 if await self._try_click_matching_option(page, ratio_candidates):
                     applied["ratio"] = ratio_value
 
         if quality:
             quality_value = str(quality).strip()
+            quality_aliases = {
+                "speed": ["Speed", "Fast", "Low", "480p"],
+                "standard": ["Standard", "Balanced", "Medium", "720p"],
+                "quality": ["Quality", "High", "HQ", "720p"],
+                "high": ["High", "Quality", "HQ", "720p"],
+                "medium": ["Medium", "Standard", "Balanced", "720p"],
+                "low": ["Low", "Speed", "Fast", "480p"],
+                "480p": ["480p", "Speed", "Low"],
+                "720p": ["720p", "Standard", "Quality", "High"],
+            }
             quality_candidates = [quality_value, quality_value.title(), quality_value.upper()]
+            quality_candidates.extend(quality_aliases.get(quality_value.strip().lower(), []))
             if await self._try_click_matching_option(page, quality_candidates):
                 applied["quality"] = quality_value
-            elif await self._try_open_dropdown(page, ["Quality"]):
+            elif await self._try_open_dropdown(page, ["Quality", "Resolution", "Mode"]):
                 await page.wait_for_timeout(400)
                 if await self._try_click_matching_option(page, quality_candidates):
                     applied["quality"] = quality_value
 
         if duration is not None and str(duration).strip():
             duration_value = str(duration).strip()
-            duration_candidates = [
-                duration_value,
-                f"{duration_value}s",
-                f"{duration_value} sec",
-                f"{duration_value} seconds",
-            ]
+            duration_aliases = {
+                "5": ["6", "6s", "6 sec", "6 seconds"],
+                "6": ["6", "6s", "6 sec", "6 seconds"],
+                "10": ["10", "10s", "10 sec", "10 seconds"],
+            }
+            duration_candidates = [duration_value]
+            duration_candidates.extend(duration_aliases.get(duration_value, []))
+            if not duration_aliases.get(duration_value):
+                duration_candidates.extend(
+                    [
+                        f"{duration_value}s",
+                        f"{duration_value} sec",
+                        f"{duration_value} seconds",
+                    ]
+                )
             if await self._try_click_matching_option(page, duration_candidates):
-                applied["duration"] = duration_value
+                applied["duration"] = "6" if video_mode and duration_value == "5" else duration_value
             elif await self._try_open_dropdown(page, ["Duration", "Length"]):
                 await page.wait_for_timeout(400)
                 if await self._try_click_matching_option(page, duration_candidates):
-                    applied["duration"] = duration_value
+                    applied["duration"] = "6" if video_mode and duration_value == "5" else duration_value
 
         return applied
 
@@ -573,6 +989,28 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     return latest
             await page.wait_for_timeout(delay_ms)
         return best_complete or latest
+
+    async def _wait_for_new_video_media(
+        self,
+        page: Page,
+        existing_media: list[str],
+        *,
+        attempts: int = 60,
+        delay_ms: int = 5000,
+    ) -> list[str]:
+        seen = {item.strip() for item in existing_media if item and item.strip()}
+        best_complete: list[str] = []
+        for _ in range(attempts):
+            latest = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
+            fresh = [item for item in latest if item not in seen]
+            if fresh:
+                if len(fresh) >= len(best_complete):
+                    best_complete = fresh
+                return fresh
+            if latest and len(latest) > len(best_complete):
+                best_complete = latest
+            await page.wait_for_timeout(delay_ms)
+        return best_complete
 
     async def _download_remote_media(self, page: Page, url: str, target_path: Path) -> str:
         payload = await page.evaluate(
@@ -615,12 +1053,22 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
     async def _capture_image_panel_fallback(self, page: Page, profile: Profile, job: AutomationJob) -> list[str]:
         panels = await self._extract_image_panels(page)
-        if not panels:
-            return []
-
         output_dir = profile_storage.output_dir(profile.id)
         captured: list[str] = []
         viewport = page.viewport_size or {"width": 1440, "height": 900}
+
+        if not panels:
+            # Last-resort customer-safe fallback: if Grok accepted the prompt but
+            # exposes the result as a transient/canvas-like surface, capture the
+            # main result area instead of failing the job with an empty output.
+            panels = [
+                {
+                    "x": max(0, min(260, viewport["width"] - 1)),
+                    "y": 40,
+                    "width": max(1, viewport["width"] - 280),
+                    "height": max(1, min(560, viewport["height"] - 80)),
+                }
+            ]
 
         for index, panel in enumerate(panels[:4], start=1):
             x = max(0, int(panel.get("x", 0)))
@@ -770,49 +1218,27 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ratio=ratio,
             quality=quality,
             duration=duration,
+            video_mode=True,
         )
 
         if prompt.strip():
-            await self._fill_prompt(
-                page,
-                [
-                    "[contenteditable='true']",
-                    "div[contenteditable='true']",
-                    "[contenteditable='true'][data-placeholder*='Type' i]",
-                    "div[contenteditable='true'][data-placeholder*='Type' i]",
-                    "textarea",
-                    "textarea[placeholder*='Type' i]",
-                    "input[placeholder*='Type' i]",
-                ],
-                prompt,
-            )
+            await self._force_refill_prompt(page, prompt)
+            await self._ensure_prompt_ready_for_submit(page, prompt)
 
-        await self._dismiss_consent_overlays(page)
-        with suppress(Exception):
-            editor = await self._first_visible(
-                page,
-                [
-                    "[contenteditable='true']",
-                    "div[contenteditable='true']",
-                    "[contenteditable='true'][data-placeholder*='Type' i]",
-                    "div[contenteditable='true'][data-placeholder*='Type' i]",
-                    "textarea",
-                    "textarea[placeholder*='Type' i]",
-                    "input[placeholder*='Type' i]",
-                ],
-                raise_on_empty=False,
-            )
-            if editor:
-                await editor.click()
-                await page.keyboard.type(" ")
-                await page.keyboard.press("Backspace")
-        await self._submit_generation(
+        await self._submit_from_editor(
             page,
             [
                 "button[aria-label='Submit']",
                 "button[type='submit']",
+                "button:has-text('Generate')",
+                "button:has-text('Create video')",
             ],
         )
+        try:
+            await page.wait_for_url("**/imagine/post/**", timeout=20000)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Video submit did not land on result page. current_url={page.url}") from exc
+        await page.wait_for_timeout(3000)
         return applied_options
 
     async def _open_imagine_image_flow(
@@ -854,21 +1280,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
         if prompt.strip():
-            await self._fill_prompt(
-                page,
-                [
-                    "[contenteditable='true']",
-                    "div[contenteditable='true']",
-                    "p[data-placeholder='Ask Grok']",
-                    "[contenteditable='true'][data-placeholder*='Type' i]",
-                    "div[contenteditable='true'][data-placeholder*='Type' i]",
-                    "textarea",
-                    "textarea[placeholder*='Ask']",
-                    "textarea[placeholder*='Type' i]",
-                    "input[placeholder*='Type' i]",
-                ],
-                prompt,
-            )
+            await self._force_refill_prompt(page, prompt)
+            await self._ensure_prompt_ready_for_submit(page, prompt)
 
         await self._submit_from_editor(
             page,
@@ -998,49 +1411,87 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             if video_mode in {"text_to_video", "image_to_video"}:
-                applied_options = await self._open_imagine_video_flow(
-                    page,
-                    job.prompt,
-                    source_asset_path if video_mode == "image_to_video" else None,
-                    ratio=str(ratio) if ratio else None,
-                    quality=str(quality) if quality else None,
-                    duration=duration,
+                video_page = page
+                with suppress(Exception):
+                    await video_page.bring_to_front()
+                try:
+                    existing_video_media = self._normalize_media_urls(
+                        await self._extract_media_urls(video_page, "video"),
+                        "video",
+                    )
+                    applied_options = await self._open_imagine_video_flow(
+                        video_page,
+                        job.prompt,
+                        source_asset_path if video_mode == "image_to_video" else None,
+                        ratio=str(ratio) if ratio else None,
+                        quality=str(quality) if quality else None,
+                        duration=duration,
+                    )
+                    media_urls = await self._wait_for_new_video_media(
+                        video_page,
+                        existing_video_media,
+                        attempts=60,
+                        delay_ms=5000,
+                    )
+                    media_urls = await self._localize_video_media(video_page, profile, job, media_urls)
+                    if not media_urls:
+                        media_urls = await self._download_file(video_page, profile, job, "video")
+                    return {
+                        "target": job.target.value,
+                        "video_mode": video_mode,
+                        "source_asset_path": source_asset_path,
+                        "ratio": ratio,
+                        "quality": quality,
+                        "duration": duration,
+                        "applied_options": applied_options,
+                        "media_urls": media_urls,
+                        "_result_page": video_page,
+                        "_close_pages": [],
+                    }
+                except Exception:
+                    with suppress(Exception):
+                        await video_page.screenshot(
+                            path=str(profile_storage.output_dir(profile.id) / f"{job.id}-video-flow-error.png"),
+                            full_page=True,
+                        )
+                    raise
+
+        image_page = await self._open_isolated_imagine_page(page)
+        try:
+            applied_options = await self._open_imagine_image_flow(
+                image_page,
+                job.prompt,
+                source_asset_path,
+                ratio=str(ratio) if ratio else None,
+                quality=str(quality) if quality else None,
+            )
+
+            media_urls = await self._wait_for_filtered_media(
+                image_page,
+                job.target.value,
+                attempts=45,
+                delay_ms=4000,
+            )
+            media_urls = await self._localize_image_media(image_page, profile, job, media_urls)
+            if not media_urls:
+                media_urls = await self._capture_image_panel_fallback(image_page, profile, job)
+            return {
+                "target": job.target.value,
+                "source_asset_path": source_asset_path,
+                "ratio": ratio,
+                "quality": quality,
+                "applied_options": applied_options,
+                "media_urls": media_urls,
+                "_result_page": image_page,
+                "_close_pages": [image_page],
+            }
+        except Exception:
+            with suppress(Exception):
+                await image_page.screenshot(
+                    path=str(profile_storage.output_dir(profile.id) / f"{job.id}-image-flow-error.png"),
+                    full_page=True,
                 )
-                media_urls = await self._wait_for_filtered_media(page, "video", attempts=36, delay_ms=5000)
-                media_urls = await self._localize_video_media(page, profile, job, media_urls)
-                if not media_urls:
-                    media_urls = await self._download_file(page, profile, job, "video")
-                return {
-                    "target": job.target.value,
-                    "video_mode": video_mode,
-                    "source_asset_path": source_asset_path,
-                    "ratio": ratio,
-                    "quality": quality,
-                    "duration": duration,
-                    "applied_options": applied_options,
-                    "media_urls": media_urls,
-                }
-
-        applied_options = await self._open_imagine_image_flow(
-            page,
-            job.prompt,
-            source_asset_path,
-            ratio=str(ratio) if ratio else None,
-            quality=str(quality) if quality else None,
-        )
-
-        media_urls = await self._wait_for_filtered_media(page, job.target.value)
-        media_urls = await self._localize_image_media(page, profile, job, media_urls)
-        if not media_urls:
-            media_urls = await self._capture_image_panel_fallback(page, profile, job)
-        return {
-            "target": job.target.value,
-            "source_asset_path": source_asset_path,
-            "ratio": ratio,
-            "quality": quality,
-            "applied_options": applied_options,
-            "media_urls": media_urls,
-        }
+            raise
 
 
 grok_provider = GrokAutomationProvider()
