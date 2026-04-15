@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -268,7 +270,19 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 return rect
         return None
 
-    async def _force_refill_prompt(self, page: Page, prompt: str) -> None:
+    async def _force_refill_prompt(
+        self,
+        page: Page,
+        prompt: str,
+        *,
+        prefer_keyboard_typing: bool = False,
+    ) -> None:
+        async def _type_prompt() -> None:
+            if prefer_keyboard_typing:
+                await page.keyboard.type(prompt, delay=25)
+            else:
+                await page.keyboard.insert_text(prompt)
+
         with suppress(Exception):
             await page.bring_to_front()
         rect = await self._bottom_composer_rect(page)
@@ -280,7 +294,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             with suppress(Exception):
                 await page.keyboard.press("Control+A")
                 await page.keyboard.press("Backspace")
-            await page.keyboard.insert_text(prompt)
+            await _type_prompt()
             await page.wait_for_timeout(700)
             if await self._editor_text(page):
                 return
@@ -289,7 +303,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             with suppress(Exception):
                 await page.keyboard.press("Control+A")
                 await page.keyboard.press("Backspace")
-            await page.keyboard.insert_text(prompt)
+            await _type_prompt()
             await page.wait_for_timeout(700)
             if await self._editor_text(page):
                 return
@@ -350,17 +364,24 @@ class GrokAutomationProvider(BaseAutomationProvider):
         await editor.click()
         with suppress(Exception):
             await page.keyboard.press("Control+A")
-        await page.keyboard.insert_text(prompt)
+            await page.keyboard.press("Backspace")
+        await _type_prompt()
         await page.wait_for_timeout(600)
 
-    async def _ensure_prompt_ready_for_submit(self, page: Page, prompt: str) -> None:
+    async def _ensure_prompt_ready_for_submit(
+        self,
+        page: Page,
+        prompt: str,
+        *,
+        prefer_keyboard_typing: bool = False,
+    ) -> None:
         expected = " ".join(prompt.split()).strip()
         for _ in range(3):
             current = await self._editor_text(page)
             enabled = await self._submit_enabled(page)
             if current == expected and enabled:
                 return
-            await self._force_refill_prompt(page, prompt)
+            await self._force_refill_prompt(page, prompt, prefer_keyboard_typing=prefer_keyboard_typing)
             with suppress(Exception):
                 await page.keyboard.press("End")
                 await page.keyboard.type(" ")
@@ -380,29 +401,34 @@ class GrokAutomationProvider(BaseAutomationProvider):
         selectors: list[str],
         *,
         accept_cleared_prompt_without_page_change: bool = False,
+        before_submit_attempt: Callable[[], None] | None = None,
+        allow_dom_submit_click: bool = True,
     ) -> None:
         with suppress(Exception):
             await page.bring_to_front()
         before = await self._body_marker(page)
         before_url = page.url
+        if before_submit_attempt:
+            before_submit_attempt()
 
         for _ in range(3):
             before_text = await self._editor_text(page)
-            with suppress(Exception):
-                clicked = await self._click_enabled_submit_dom(page)
-                if clicked:
-                    await page.wait_for_timeout(2000)
-                    after_url = page.url
-                    after_marker = await self._body_marker(page)
-                    if (
-                        after_url != before_url
-                        or (after_marker and after_marker != before)
-                        or (
-                            accept_cleared_prompt_without_page_change
-                            and await self._prompt_cleared_after_submit(page, before_text)
-                        )
-                    ):
-                        return
+            if allow_dom_submit_click:
+                with suppress(Exception):
+                    clicked = await self._click_enabled_submit_dom(page)
+                    if clicked:
+                        await page.wait_for_timeout(2000)
+                        after_url = page.url
+                        after_marker = await self._body_marker(page)
+                        if (
+                            after_url != before_url
+                            or (after_marker and after_marker != before)
+                            or (
+                                accept_cleared_prompt_without_page_change
+                                and await self._prompt_cleared_after_submit(page, before_text)
+                            )
+                        ):
+                            return
 
             submit = await self._first_visible(page, selectors, raise_on_empty=False)
             if submit:
@@ -1037,30 +1063,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         return best_complete
 
-    async def _wait_for_new_image_media(
+    async def _wait_for_fresh_image_media(
         self,
         page: Page,
-        existing_media: list[str],
-        *,
-        attempts: int = 45,
-        delay_ms: int = 4000,
-    ) -> list[str]:
-        seen = {item.strip() for item in existing_media if item and item.strip()}
-        best_complete: list[str] = []
-        for _ in range(attempts):
-            latest = self._normalize_media_urls(await self._extract_media_urls(page, "image"), "image")
-            fresh = [item for item in latest if item not in seen]
-            if fresh:
-                if len(fresh) >= len(best_complete):
-                    best_complete = fresh
-                return fresh
-            if latest and len(latest) > len(best_complete):
-                best_complete = latest
-            await page.wait_for_timeout(delay_ms)
-        return best_complete
-
-    async def _wait_for_observed_image_responses(
-        self,
         observed_urls: list[str],
         existing_media: list[str],
         *,
@@ -1068,19 +1073,29 @@ class GrokAutomationProvider(BaseAutomationProvider):
         delay_ms: int = 4000,
     ) -> list[str]:
         seen = {item.strip() for item in existing_media if item and item.strip()}
+        best_complete: list[str] = []
         for _ in range(attempts):
-            fresh: list[str] = []
+            fresh_observed: list[str] = []
             dedup: set[str] = set()
             for item in observed_urls:
                 normalized = item.strip()
                 if not normalized or normalized in seen or normalized in dedup:
                     continue
                 dedup.add(normalized)
-                fresh.append(normalized)
-            if fresh:
-                return fresh[:4]
-            await asyncio.sleep(delay_ms / 1000)
-        return []
+                fresh_observed.append(normalized)
+            if fresh_observed:
+                return fresh_observed[:4]
+
+            latest = self._normalize_media_urls(await self._extract_media_urls(page, "image"), "image")
+            fresh_dom = [item for item in latest if item not in seen]
+            if fresh_dom:
+                if len(fresh_dom) >= len(best_complete):
+                    best_complete = fresh_dom
+                return fresh_dom
+            if latest and len(latest) > len(best_complete):
+                best_complete = latest
+            await page.wait_for_timeout(delay_ms)
+        return best_complete
 
     async def _download_remote_media(self, page: Page, url: str, target_path: Path) -> str:
         payload = await page.evaluate(
@@ -1320,6 +1335,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         *,
         ratio: str | None = None,
         quality: str | None = None,
+        before_submit_attempt: Callable[[], None] | None = None,
     ) -> dict:
         await self._ensure_imagine_page(page)
         await self._dismiss_consent_overlays(page)
@@ -1351,8 +1367,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
         if prompt.strip():
-            await self._force_refill_prompt(page, prompt)
-            await self._ensure_prompt_ready_for_submit(page, prompt)
+            await self._force_refill_prompt(page, prompt, prefer_keyboard_typing=True)
+            await self._ensure_prompt_ready_for_submit(page, prompt, prefer_keyboard_typing=True)
 
         await self._submit_from_editor(
             page,
@@ -1363,6 +1379,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "button:has-text('Generate')",
             ],
             accept_cleared_prompt_without_page_change=True,
+            before_submit_attempt=before_submit_attempt,
+            allow_dom_submit_click=False,
         )
         return applied_options
 
@@ -1539,6 +1557,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 return
             observed_image_urls.append(url)
 
+        def _reset_observed_image_responses() -> None:
+            observed_image_urls.clear()
+
         try:
             existing_image_media = self._normalize_media_urls(
                 await self._extract_media_urls(image_page, "image"),
@@ -1551,21 +1572,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 source_asset_path,
                 ratio=str(ratio) if ratio else None,
                 quality=str(quality) if quality else None,
+                before_submit_attempt=_reset_observed_image_responses,
             )
 
-            media_urls = await self._wait_for_observed_image_responses(
+            media_urls = await self._wait_for_fresh_image_media(
+                image_page,
                 observed_image_urls,
                 existing_image_media,
                 attempts=60,
                 delay_ms=4000,
             )
-            if not media_urls:
-                media_urls = await self._wait_for_new_image_media(
-                    image_page,
-                    existing_image_media,
-                    attempts=60,
-                    delay_ms=4000,
-                )
             media_urls = self._normalize_media_urls(media_urls, "image")
             media_urls = await self._localize_image_media(image_page, profile, job, media_urls)
             if not media_urls:
