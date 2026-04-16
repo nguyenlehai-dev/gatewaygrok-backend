@@ -825,6 +825,58 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         raise RuntimeError(f"Could not switch Grok video mode to '{target_label}'.")
 
+    async def _click_composer_video_mode(self, page: Page) -> bool:
+        clicked = await page.evaluate(
+            r"""
+            () => {
+              const isVisible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width >= 24 &&
+                  rect.height >= 24 &&
+                  rect.bottom > window.innerHeight - 160 &&
+                  rect.right > window.innerWidth * 0.55 &&
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  Number(style.opacity || "1") > 0.05
+                );
+              };
+              const buttons = Array.from(document.querySelectorAll("button, [role='button']")).filter(isVisible);
+              const scoreButton = (button) => {
+                const rect = button.getBoundingClientRect();
+                const text = [
+                  button.innerText || "",
+                  button.getAttribute("aria-label") || "",
+                  button.getAttribute("title") || "",
+                ].join(" ").toLowerCase();
+                let score = 0;
+                if (text.includes("video")) score += 500;
+                if (text.includes("camera")) score += 120;
+                if (button.querySelector("svg")) score += 100;
+                if (rect.right >= window.innerWidth - 140) score += 120;
+                if (rect.bottom >= window.innerHeight - 90) score += 120;
+                if (rect.width <= 80 && rect.height <= 80) score += 40;
+                if (text.includes("submit") || text.includes("send")) score -= 300;
+                if (text.includes("image") || text.includes("photo")) score -= 80;
+                if (button.closest("aside, nav, header")) score -= 300;
+                return score;
+              };
+              buttons.sort((left, right) => scoreButton(right) - scoreButton(left));
+              const target = buttons[0];
+              if (!(target instanceof HTMLElement) || scoreButton(target) < 220) {
+                return false;
+              }
+              target.click();
+              return true;
+            }
+            """
+        )
+        if clicked:
+            await page.wait_for_timeout(800)
+        return bool(clicked)
+
     async def _wait_for_filtered_media(self, page: Page, target: str, attempts: int = 18, delay_ms: int = 4000) -> list[str]:
         latest: list[str] = []
         best_complete: list[str] = []
@@ -941,6 +993,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         await page.wait_for_timeout(800)
         with suppress(Exception):
             await self._select_video_submode(page, video_mode)
+        if video_mode == "image_to_video":
+            with suppress(Exception):
+                await self._click_composer_video_mode(page)
 
         if source_asset_path:
             source_file = Path(source_asset_path)
@@ -958,6 +1013,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
         await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
+        if video_mode == "image_to_video":
+            with suppress(Exception):
+                await self._click_composer_video_mode(page)
 
         try:
             submit = await self._find_submit_button(page)
@@ -1188,7 +1246,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 )
                 media_urls: list[str] = []
                 if video_mode == "image_to_video":
-                    media_urls = await self._download_video_asset(page, profile, job)
+                    try:
+                        media_urls = await self._download_video_asset(page, profile, job)
+                    except RuntimeError:
+                        media_urls = []
                 if not media_urls:
                     media_urls = await self._download_file(page, profile, job, "video")
                 if not media_urls:
