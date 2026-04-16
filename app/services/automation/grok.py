@@ -524,6 +524,124 @@ class GrokAutomationProvider(BaseAutomationProvider):
         reason = await self._read_submit_disabled_reason(page)
         raise RuntimeError(f"submit button stayed disabled before click for {flow_label}. {reason}.")
 
+    async def _fill_grok_prompt(self, page: Page, prompt: str, *, edit_mode: bool = False) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            return
+
+        placeholder_selectors = [
+            "[contenteditable='true'][data-placeholder*='Describe' i]",
+            "div[contenteditable='true'][data-placeholder*='Describe' i]",
+            "p[data-placeholder*='Describe' i]",
+            "[role='textbox'][aria-label*='Describe' i]",
+            "[aria-label*='Describe' i]",
+            "[contenteditable='true'][data-placeholder*='Ask' i]",
+            "div[contenteditable='true'][data-placeholder*='Ask' i]",
+            "p[data-placeholder*='Ask' i]",
+            "[contenteditable='true'][data-placeholder*='Type' i]",
+            "div[contenteditable='true'][data-placeholder*='Type' i]",
+            "[role='textbox']",
+            "div[role='textbox']",
+            "[contenteditable='true']",
+            "div[contenteditable='true']",
+            "textarea[placeholder*='imagine' i]",
+            "input[placeholder*='imagine' i]",
+            "textarea[placeholder*='Ask' i]",
+            "textarea[placeholder*='Type' i]",
+            "input[placeholder*='Type' i]",
+            "textarea",
+        ]
+
+        if not edit_mode:
+            await self._fill_prompt(page, placeholder_selectors, prompt)
+            return
+
+        filled = await page.evaluate(
+            r"""
+            (prompt) => {
+              const isVisible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width >= 120 &&
+                  rect.height >= 18 &&
+                  rect.bottom > 0 &&
+                  rect.right > 0 &&
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  Number(style.opacity || "1") > 0.05
+                );
+              };
+              const textOf = (el) => [
+                el.getAttribute("data-placeholder") || "",
+                el.getAttribute("aria-label") || "",
+                el.getAttribute("placeholder") || "",
+                el.innerText || "",
+              ].join(" ").toLowerCase();
+              const candidates = Array.from(
+                document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
+              ).filter(isVisible);
+              const score = (el) => {
+                const rect = el.getBoundingClientRect();
+                const text = textOf(el);
+                let value = 0;
+                if (text.includes("describe your edit")) value += 500;
+                if (text.includes("describe")) value += 260;
+                if (text.includes("edit")) value += 180;
+                if (text.includes("ask grok")) value += 120;
+                if (text.includes("type")) value += 80;
+                if (el.isContentEditable) value += 80;
+                if (el.getAttribute("role") === "textbox") value += 50;
+                if (rect.bottom >= window.innerHeight - 260) value += 160;
+                if (el.closest("aside, nav, header")) value -= 240;
+                if (rect.width < 180) value -= 80;
+                return value;
+              };
+              candidates.sort((left, right) => score(right) - score(left));
+              const target = candidates[0];
+              if (!(target instanceof HTMLElement) || score(target) < 120) {
+                return false;
+              }
+              target.focus();
+              if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+                target.value = prompt;
+                target.dispatchEvent(new Event("input", { bubbles: true }));
+                target.dispatchEvent(new Event("change", { bubbles: true }));
+                return true;
+              }
+              document.execCommand("selectAll", false);
+              document.execCommand("insertText", false, prompt);
+              target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
+              return true;
+            }
+            """,
+            prompt,
+        )
+        if filled:
+            await page.wait_for_timeout(300)
+
+        prompt_present = await page.evaluate(
+            r"""
+            (prompt) => {
+              const expected = prompt.trim().slice(0, 80).toLowerCase();
+              if (!expected) return true;
+              const fields = Array.from(
+                document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
+              );
+              return fields.some((el) => {
+                const value = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
+                  ? el.value
+                  : el.innerText;
+                return (value || "").trim().toLowerCase().includes(expected);
+              });
+            }
+            """,
+            prompt,
+        )
+        if not prompt_present:
+            await self._fill_prompt(page, placeholder_selectors, prompt)
+
     async def _click_submit_fallback(self, page: Page) -> bool:
         return bool(
             await page.evaluate(
@@ -839,25 +957,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             duration=duration,
         )
 
-        if prompt.strip():
-            await self._fill_prompt(
-                page,
-                [
-                    "[contenteditable='true']",
-                    "div[contenteditable='true']",
-                    "[contenteditable='true'][data-placeholder*='Type' i]",
-                    "div[contenteditable='true'][data-placeholder*='Type' i]",
-                    "[role='textbox']",
-                    "div[role='textbox']",
-                    "[aria-label*='Type' i]",
-                    "textarea[placeholder*='imagine' i]",
-                    "input[placeholder*='imagine' i]",
-                    "textarea",
-                    "textarea[placeholder*='Type' i]",
-                    "input[placeholder*='Type' i]",
-                ],
-                prompt,
-            )
+        await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
 
         try:
             submit = await self._find_submit_button(page)
@@ -930,27 +1030,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             quality=quality,
         )
 
-        if prompt.strip():
-            await self._fill_prompt(
-                page,
-                [
-                    "[contenteditable='true']",
-                    "div[contenteditable='true']",
-                    "p[data-placeholder='Ask Grok']",
-                    "[contenteditable='true'][data-placeholder*='Type' i]",
-                    "div[contenteditable='true'][data-placeholder*='Type' i]",
-                    "[role='textbox']",
-                    "div[role='textbox']",
-                    "[aria-label*='Type' i]",
-                    "textarea[placeholder*='imagine' i]",
-                    "input[placeholder*='imagine' i]",
-                    "textarea",
-                    "textarea[placeholder*='Ask']",
-                    "textarea[placeholder*='Type' i]",
-                    "input[placeholder*='Type' i]",
-                ],
-                prompt,
-            )
+        await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
 
         submit_locator = await self._wait_for_enabled_submit_button(page, "image")
         await submit_locator.click(timeout=3000)
