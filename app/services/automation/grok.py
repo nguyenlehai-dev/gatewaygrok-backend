@@ -1079,85 +1079,98 @@ class GrokAutomationProvider(BaseAutomationProvider):
         quality: str | None = None,
         duration: int | str | None = None,
     ) -> dict:
-        await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
-        video_mode_button = await self._wait_for_action_button(
-            page,
-            [
-                "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
-                "[aria-label='Generation mode'] >> text=Video",
-            ],
-            attempts=12,
-            delay_ms=2000,
-        )
-        if await video_mode_button.get_attribute("aria-checked") != "true":
-            await video_mode_button.click()
-        await page.wait_for_timeout(800)
-        with suppress(Exception):
-            await self._select_video_submode(page, video_mode)
-        if video_mode == "image_to_video":
-            with suppress(Exception):
-                await self._click_composer_video_mode(page)
-
-        if source_asset_path:
-            source_file = Path(source_asset_path)
-            if not source_file.exists():
-                raise RuntimeError(f"Source asset not found: {source_asset_path}")
-            upload_input = await self._first_visible(page, ["input[type='file']"])
-            await upload_input.set_input_files(str(source_file))
-            await page.wait_for_timeout(2000)
-            if video_mode == "image_to_video":
-                with suppress(Exception):
-                    await self._click_composer_video_mode(page)
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+                video_mode_button = await self._wait_for_action_button(
+                    page,
+                    [
+                        "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
+                        "[aria-label='Generation mode'] >> text=Video",
+                    ],
+                    attempts=12,
+                    delay_ms=2000,
+                )
+                if await video_mode_button.get_attribute("aria-checked") != "true":
+                    await video_mode_button.click()
+                await page.wait_for_timeout(800)
                 with suppress(Exception):
                     await self._select_video_submode(page, video_mode)
+                if video_mode == "image_to_video":
+                    with suppress(Exception):
+                        await self._click_composer_video_mode(page)
 
-        option_state = await self._apply_generation_options(
-            page,
-            ratio=ratio,
-            quality=quality,
-            duration=duration,
-        )
+                if source_asset_path:
+                    source_file = Path(source_asset_path)
+                    if not source_file.exists():
+                        raise RuntimeError(f"Source asset not found: {source_asset_path}")
+                    upload_input = await self._first_visible(page, ["input[type='file']"])
+                    await upload_input.set_input_files(str(source_file))
+                    await page.wait_for_timeout(2000)
+                    if video_mode == "image_to_video":
+                        with suppress(Exception):
+                            await self._click_composer_video_mode(page)
+                        with suppress(Exception):
+                            await self._select_video_submode(page, video_mode)
 
-        await self._fill_grok_prompt(page, prompt, edit_mode=False)
-        if video_mode == "image_to_video":
-            with suppress(Exception):
-                await self._click_composer_video_mode(page)
-            await self._fill_grok_prompt(page, prompt, edit_mode=False)
-            await self._ensure_video_generation_state(page, prompt)
+                option_state = await self._apply_generation_options(
+                    page,
+                    ratio=ratio,
+                    quality=quality,
+                    duration=duration,
+                )
 
-        try:
-            submit = await self._find_submit_button(page)
-        except RuntimeError as exc:
-            page_url = page.url
-            body_preview = await self._body_preview(page)
-            raise SubmitButtonDisabledError(
-                f"Grok did not render a detectable submit button for {video_mode.replace('_', '-')}. "
-                f"page_url={page_url}. body_preview={body_preview[:300]}"
-            ) from exc
-        try:
-            submit = await self._wait_for_enabled_submit_button(
-                page,
-                video_mode.replace("_", "-"),
-                attempts=30 if video_mode == "image_to_video" else 15,
-                delay_ms=1000,
-            )
-        except RuntimeError as exc:
-            if video_mode == "image_to_video" and await self._click_submit_fallback(page):
+                await self._fill_grok_prompt(page, prompt, edit_mode=False)
+                if video_mode == "image_to_video":
+                    with suppress(Exception):
+                        await self._click_composer_video_mode(page)
+                    await self._fill_grok_prompt(page, prompt, edit_mode=False)
+                    await self._ensure_video_generation_state(page, prompt)
+
+                try:
+                    submit = await self._find_submit_button(page)
+                except RuntimeError as exc:
+                    page_url = page.url
+                    body_preview = await self._body_preview(page)
+                    raise SubmitButtonDisabledError(
+                        f"Grok did not render a detectable submit button for {video_mode.replace('_', '-')}. "
+                        f"page_url={page_url}. body_preview={body_preview[:300]}"
+                    ) from exc
+                try:
+                    submit = await self._wait_for_enabled_submit_button(
+                        page,
+                        video_mode.replace("_", "-"),
+                        attempts=30 if video_mode == "image_to_video" else 15,
+                        delay_ms=1000,
+                    )
+                except RuntimeError as exc:
+                    if video_mode == "image_to_video" and await self._click_submit_fallback(page):
+                        await page.wait_for_timeout(1500)
+                        blocked_message = await self._detect_content_policy_block(page, "video")
+                        if blocked_message:
+                            raise ContentPolicyBlockedError(blocked_message) from exc
+                        return option_state
+                    reason = await self._read_submit_disabled_reason(page)
+                    raise SubmitButtonDisabledError(
+                        f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
+                    ) from exc
+                await submit.click(timeout=3000)
                 await page.wait_for_timeout(1500)
                 blocked_message = await self._detect_content_policy_block(page, "video")
                 if blocked_message:
-                    raise ContentPolicyBlockedError(blocked_message) from exc
+                    raise ContentPolicyBlockedError(blocked_message)
                 return option_state
-            reason = await self._read_submit_disabled_reason(page)
-            raise SubmitButtonDisabledError(
-                f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
-            ) from exc
-        await submit.click(timeout=3000)
-        await page.wait_for_timeout(1500)
-        blocked_message = await self._detect_content_policy_block(page, "video")
-        if blocked_message:
-            raise ContentPolicyBlockedError(blocked_message)
-        return option_state
+            except SubmitButtonDisabledError as exc:
+                last_exc = exc
+                if video_mode != "image_to_video" or attempt == 1:
+                    raise
+                await page.wait_for_timeout(1200)
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Grok video flow could not be prepared.")
 
     async def _open_imagine_image_flow(
         self,
