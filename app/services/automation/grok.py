@@ -1106,6 +1106,81 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if not normalized_values:
             return False
 
+        clicked = await page.evaluate(
+            r"""
+            (values) => {
+              const normalized = Array.from(new Set((values || []).map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)));
+              if (!normalized.length) return false;
+
+              const isVisible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width >= 20 &&
+                  rect.height >= 20 &&
+                  rect.bottom > 0 &&
+                  rect.right > 0 &&
+                  rect.top < window.innerHeight &&
+                  rect.left < window.innerWidth &&
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  Number(style.opacity || "1") > 0.05
+                );
+              };
+
+              const candidates = Array.from(
+                document.querySelectorAll("button, [role='button'], [role='option'], [role='radio'], [role='menuitemradio'], label")
+              );
+
+              const textOf = (el) =>
+                [
+                  el.textContent || "",
+                  el.getAttribute("aria-label") || "",
+                  el.getAttribute("title") || "",
+                ]
+                  .join(" ")
+                  .replace(/\s+/g, " ")
+                  .trim()
+                  .toLowerCase();
+
+              let best = null;
+              let bestScore = -1;
+              for (const el of candidates) {
+                if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+                const text = textOf(el);
+                if (!text) continue;
+                let matched = null;
+                for (const value of normalized) {
+                  if (text === value || text.startsWith(value + " ") || text.endsWith(" " + value) || text.includes(" " + value + " ")) {
+                    matched = value;
+                    break;
+                  }
+                }
+                if (!matched) continue;
+                const rect = el.getBoundingClientRect();
+                let score = matched.length * 10;
+                if (el.getAttribute("role") === "radio" || el.getAttribute("role") === "option") score += 120;
+                if (el.tagName === "BUTTON") score += 90;
+                if (text === matched) score += 160;
+                if (rect.width >= 32 && rect.height >= 28) score += 40;
+                if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") score -= 40;
+                if (score > bestScore) {
+                  best = el;
+                  bestScore = score;
+                }
+              }
+
+              if (!(best instanceof HTMLElement) || bestScore < 80) return false;
+              best.click();
+              return true;
+            }
+            """,
+            normalized_values,
+        )
+        if clicked:
+            return True
+
         selectors: list[str] = []
         for value in normalized_values:
             selectors.extend(
@@ -1129,6 +1204,19 @@ class GrokAutomationProvider(BaseAutomationProvider):
             except Exception:  # noqa: BLE001
                 continue
         return False
+
+    def _quality_candidates(self, quality: str) -> list[str]:
+        value = str(quality).strip().lower()
+        aliases = {
+            "low": ["360p", "low"],
+            "medium": ["480p", "medium", "standard"],
+            "high": ["720p", "high", "hd"],
+            "360p": ["360p", "low"],
+            "480p": ["480p", "medium", "standard"],
+            "720p": ["720p", "high", "hd"],
+            "hd": ["720p", "high", "hd"],
+        }
+        return aliases.get(value, [quality, quality.title(), quality.upper()])
 
     async def _try_open_dropdown(self, page: Page, labels: list[str]) -> bool:
         selectors: list[str] = []
@@ -1550,7 +1638,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         if quality:
             quality_value = str(quality).strip()
-            quality_candidates = [quality_value, quality_value.title(), quality_value.upper()]
+            quality_candidates = self._quality_candidates(quality_value)
             if await self._try_click_matching_option(page, quality_candidates):
                 applied["quality"] = quality_value
             elif await self._try_open_dropdown(page, ["Quality"]):
