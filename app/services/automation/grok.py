@@ -549,7 +549,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             )
             if isinstance(video_urls, list) and any(str(url).strip() for url in video_urls):
                 return [str(url).strip() for url in video_urls if str(url).strip()]
-            return await super()._extract_media_urls(page, target)
+            return []
 
         if target != "image":
             return await super()._extract_media_urls(page, target)
@@ -768,6 +768,92 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     raise ContentPolicyBlockedError(hidden_message)
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
+
+    async def _click_download_button_fallback(self, page: Page) -> bool:
+        return bool(
+            await page.evaluate(
+                r"""
+                () => {
+                  const isVisible = (element) => {
+                    if (!(element instanceof HTMLElement)) return false;
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    return (
+                      rect.width >= 24 &&
+                      rect.height >= 24 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      rect.top < window.innerHeight &&
+                      rect.left < window.innerWidth &&
+                      style.visibility !== "hidden" &&
+                      style.display !== "none" &&
+                      !element.disabled
+                    );
+                  };
+
+                  const parsePoints = (value) => {
+                    return String(value || "")
+                      .trim()
+                      .split(/\s+/)
+                      .map((pair) => pair.split(",").map(Number))
+                      .filter((point) => point.length === 2 && point.every(Number.isFinite));
+                  };
+
+                  const looksLikeDownloadIcon = (button) => {
+                    for (const polyline of Array.from(button.querySelectorAll("polyline"))) {
+                      const points = parsePoints(polyline.getAttribute("points"));
+                      if (points.length >= 3) {
+                        const [left, middle, right] = points;
+                        const arrowPointsDown = middle[1] > left[1] && middle[1] > right[1];
+                        if (arrowPointsDown) return true;
+                      }
+                    }
+                    for (const line of Array.from(button.querySelectorAll("line"))) {
+                      const x1 = Number(line.getAttribute("x1"));
+                      const x2 = Number(line.getAttribute("x2"));
+                      const y1 = Number(line.getAttribute("y1"));
+                      const y2 = Number(line.getAttribute("y2"));
+                      if (Number.isFinite(x1) && Number.isFinite(x2) && Number.isFinite(y1) && Number.isFinite(y2)) {
+                        if (Math.abs(x1 - x2) <= 0.5 && y2 > y1) return true;
+                      }
+                    }
+                    const html = button.innerHTML.toLowerCase();
+                    return html.includes("download") || html.includes("arrow-down");
+                  };
+
+                  const scoreButton = (button) => {
+                    if (!isVisible(button)) return -10000;
+                    const rect = button.getBoundingClientRect();
+                    const label = [
+                      button.getAttribute("aria-label") || "",
+                      button.getAttribute("title") || "",
+                      button.innerText || "",
+                    ].join(" ").toLowerCase();
+                    let score = 0;
+                    if (label.includes("download") || label.includes("tải") || label.includes("tai xuong")) score += 1200;
+                    if (looksLikeDownloadIcon(button)) score += 900;
+                    if (button.querySelector("svg")) score += 80;
+                    if (rect.left >= window.innerWidth * 0.55) score += 160;
+                    if (rect.right >= window.innerWidth - 260) score += 100;
+                    if (rect.width <= 72 && rect.height <= 72) score += 80;
+                    if (button.closest("aside, nav, header")) score -= 500;
+                    if (label.includes("share") || label.includes("upload") || label.includes("retry")) score -= 800;
+                    if (label.includes("delete") || label.includes("close") || label === "x") score -= 800;
+                    if (label.includes("like") || label.includes("heart") || label.includes("favorite")) score -= 800;
+                    if (label.includes("more") || label.includes("menu")) score -= 800;
+                    return score;
+                  };
+
+                  const buttons = Array.from(document.querySelectorAll("button"));
+                  buttons.sort((left, right) => scoreButton(right) - scoreButton(left));
+                  const target = buttons[0];
+                  if (!(target instanceof HTMLElement) || scoreButton(target) < 700) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            )
+        )
 
     async def _try_click_matching_option(self, page: Page, values: list[str]) -> bool:
         normalized_values = [value.strip() for value in values if value and value.strip()]
@@ -1446,17 +1532,6 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 push(media.getAttribute("data-href") || "");
               }
 
-              const html = document.documentElement?.innerHTML || "";
-              const regex = /https?:\/\/[^"'\\s<>]+(?:generated_video[^"'\\s<>]*|share-videos\/[^"'\\s<>]+\.mp4[^"'\\s<>]*)/gi;
-              for (const match of html.matchAll(regex)) {
-                push(match[0] || "");
-              }
-
-              const looseMp4Regex = /https?:\/\/[^"'\\s<>]+\.mp4[^"'\\s<>]*/gi;
-              for (const match of html.matchAll(looseMp4Regex)) {
-                push(match[0] || "");
-              }
-
               return values;
             }
             """
@@ -1533,6 +1608,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         baseline_urls: list[str] | None = None,
     ) -> list[str]:
         elapsed = 0
+        download_without_video_hits = 0
         while elapsed < timeout_ms:
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
@@ -1555,7 +1631,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     self._log_job_step(job, "video_ready_download_visible")
                     return []
                 if state.get("hasDownload"):
+                    download_without_video_hits += 1
                     self._log_job_step(job, "video_download_visible_without_video")
+                    if download_without_video_hits >= 4:
+                        self._log_job_step(job, "video_image_result_detected")
+                        return []
+                else:
+                    download_without_video_hits = 0
                 if state.get("generating"):
                     progress = state.get("progress") or "unknown"
                     self._log_job_step(job, f"video_generation_in_progress progress={progress}")
@@ -1644,6 +1726,27 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 localized.append(await self._download_remote_media(page, url, target_path))
             except Exception:  # noqa: BLE001
                 localized.append(url)
+        return localized
+
+    async def _localize_video_media(self, page: Page, profile: Profile, job: AutomationJob, media_urls: list[str]) -> list[str]:
+        output_dir = profile_storage.output_dir(profile.id)
+        localized: list[str] = []
+        for index, url in enumerate(media_urls, start=1):
+            value = str(url).strip()
+            if not value:
+                continue
+            if not value.startswith(("http://", "https://", "data:")):
+                localized.append(value)
+                continue
+
+            target_path = output_dir / f"{job.id}-video-{index}.mp4"
+            try:
+                if value.startswith("data:"):
+                    localized.append(await self._save_data_url(value, target_path))
+                else:
+                    localized.append(await self._download_remote_media(page, value, target_path))
+            except Exception:  # noqa: BLE001
+                continue
         return localized
 
     async def _open_imagine_video_flow(
@@ -1814,28 +1917,41 @@ class GrokAutomationProvider(BaseAutomationProvider):
         attempts: int = 24,
         delay_ms: int = 5000,
     ) -> list[str]:
-        download_button = await self._wait_for_action_button(
-            page,
-            [
-                "button[aria-label='Download']",
-                "button:has-text('Download')",
-            ],
-            attempts=attempts,
-            delay_ms=delay_ms,
-            policy_target=suffix_label,
-        )
-
         output_dir = profile_storage.output_dir(profile.id)
-        for attempt in range(8):
+        for attempt in range(max(attempts, 8)):
+            download_button = None
+            try:
+                download_button = await self._wait_for_action_button(
+                    page,
+                    [
+                        "button[aria-label='Download']",
+                        "button[title='Download']",
+                        "button:has-text('Download')",
+                    ],
+                    attempts=1,
+                    delay_ms=0,
+                    policy_target=suffix_label,
+                )
+            except RuntimeError:
+                download_button = None
+
             try:
                 async with page.expect_download(timeout=30000) as download_info:
-                    await download_button.click()
+                    if download_button is not None:
+                        await download_button.click()
+                    else:
+                        clicked = await self._click_download_button_fallback(page)
+                        if not clicked:
+                            raise RuntimeError("No download button candidate found")
                 download = await download_info.value
             except Exception:  # noqa: BLE001
                 blocked_message = await self._detect_content_policy_block(page, suffix_label)
                 if blocked_message:
                     raise ContentPolicyBlockedError(blocked_message)
-                await page.wait_for_timeout(5000)
+                hidden_message = await self._detect_hidden_media_block(page, suffix_label)
+                if hidden_message:
+                    raise ContentPolicyBlockedError(hidden_message)
+                await page.wait_for_timeout(delay_ms)
                 continue
 
             suggested = download.suggested_filename
@@ -1843,12 +1959,14 @@ class GrokAutomationProvider(BaseAutomationProvider):
             if suffix_label == "video" and suffix not in {".mp4", ".webm", ".mov"}:
                 with suppress(Exception):
                     await download.cancel()
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(delay_ms)
                 continue
             target_path = output_dir / f"{job.id}-{suffix_label}-{attempt + 1}{suffix or '.bin'}"
             await download.save_as(str(target_path))
             try:
                 if target_path.exists() and target_path.stat().st_size < 1024:
+                    with suppress(Exception):
+                        target_path.unlink()
                     continue
             except Exception:
                 pass
@@ -1856,6 +1974,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         return []
 
     async def _download_video_asset(self, page: Page, profile: Profile, job: AutomationJob) -> list[str]:
+        baseline_urls = await self._extract_ready_video_urls(page)
         try:
             make_video_button = await self._wait_for_action_button(
                 page,
@@ -1871,11 +1990,21 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 raise ContentPolicyBlockedError(hidden_message) from exc
             raise
         await make_video_button.click()
+        self._log_job_step(job, "make_video_clicked")
 
         try:
             await page.wait_for_url("**/imagine/post/**", timeout=90000)
         except Exception:  # noqa: BLE001
             pass
+
+        media_urls = await self._wait_for_video_ready(
+            page,
+            job,
+            timeout_ms=480000,
+            baseline_urls=baseline_urls,
+        )
+        if media_urls:
+            return media_urls
 
         return await self._download_file(page, profile, job, "video")
 
@@ -2045,7 +2174,6 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                     )
-                    media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
                     post_video_urls = await self._extract_submitted_post_video_urls(page, submitted_post_url)
                     if isinstance(baseline_video_urls, list):
                         post_video_urls = self._filter_new_media_urls(post_video_urls, baseline_video_urls)
@@ -2053,7 +2181,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         self._log_job_step(job, f"submitted_post_video_detected media_count={len(post_video_urls)}")
                         media_urls = post_video_urls
                     state = await self._video_generation_state(page)
-                    if isinstance(state, dict) and (state.get("hasDownload") or state.get("hasVideo")):
+                    if not media_urls and isinstance(state, dict) and state.get("hasDownload") and not state.get("hasVideo"):
+                        self._log_job_step(job, "make_video_fallback_start")
+                        try:
+                            media_urls = await asyncio.wait_for(
+                                self._download_video_asset(page, profile, job),
+                                timeout=600,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            self._log_job_step(job, f"make_video_fallback_unavailable reason={type(exc).__name__}")
+                            media_urls = []
+                    if isinstance(state, dict) and state.get("hasVideo"):
                         self._log_job_step(job, "direct_video_download_preferred")
                         try:
                             downloaded_media = await asyncio.wait_for(
@@ -2074,7 +2212,6 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
                         network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
-                    network_video_urls = self._filter_video_urls_for_submitted_post(network_video_urls, submitted_post_url)
                     if network_video_urls and not media_urls:
                         media_urls = network_video_urls
                     if not media_urls:
@@ -2101,7 +2238,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
                             self._wait_for_media(page, "video"),
                             timeout=150,
                         )
-                        media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
+                    if not media_urls:
+                        self._log_job_step(job, "make_video_fallback_start")
+                        try:
+                            media_urls = await asyncio.wait_for(
+                                self._download_video_asset(page, profile, job),
+                                timeout=600,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            self._log_job_step(job, f"make_video_fallback_unavailable reason={type(exc).__name__}")
+                            media_urls = []
                     if not media_urls and video_mode == "image_to_video":
                         self._log_job_step(job, "image_result_to_video_fallback_start")
                         try:
@@ -2123,6 +2269,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                                     localized.append(await self._download_remote_media(page, url, target_path))
                             media_urls = localized
                     media_urls = self._normalize_media_urls(media_urls, "video")
+                    if media_urls:
+                        localized_media_urls = await self._localize_video_media(page, profile, job, media_urls)
+                        if localized_media_urls:
+                            media_urls = localized_media_urls
                     if not media_urls:
                         if video_mode == "image_to_video":
                             raise InvalidVideoOutputError(
