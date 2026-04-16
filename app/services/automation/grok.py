@@ -64,6 +64,28 @@ class GrokAutomationProvider(BaseAutomationProvider):
             f"Follow these appearance and scene details: {normalized}"
         )
 
+    async def _prompt_present(self, page: Page, prompt: str) -> bool:
+        return bool(
+            await page.evaluate(
+                r"""
+                (prompt) => {
+                  const expected = prompt.trim().slice(0, 80).toLowerCase();
+                  if (!expected) return true;
+                  const fields = Array.from(
+                    document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
+                  );
+                  return fields.some((el) => {
+                    const value = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
+                      ? el.value
+                      : el.innerText;
+                    return (value || "").trim().toLowerCase().includes(expected);
+                  });
+                }
+                """,
+                prompt,
+            )
+        )
+
     async def _ensure_video_generation_state(self, page: Page, prompt: str) -> None:
         expected = prompt.strip().lower()[:80]
         for _ in range(3):
@@ -654,94 +676,89 @@ class GrokAutomationProvider(BaseAutomationProvider):
             "textarea",
         ]
 
-        filled = await page.evaluate(
-            r"""
-            ({ prompt, editMode }) => {
-              const isVisible = (el) => {
-                if (!(el instanceof HTMLElement)) return false;
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return (
-                  rect.width >= 120 &&
-                  rect.height >= 18 &&
-                  rect.bottom > 0 &&
-                  rect.right > 0 &&
-                  style.display !== "none" &&
-                  style.visibility !== "hidden" &&
-                  Number(style.opacity || "1") > 0.05
-                );
-              };
-              const textOf = (el) => [
-                el.getAttribute("data-placeholder") || "",
-                el.getAttribute("aria-label") || "",
-                el.getAttribute("placeholder") || "",
-                el.innerText || "",
-              ].join(" ").toLowerCase();
-              const candidates = Array.from(
-                document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
-              ).filter(isVisible);
-              const score = (el) => {
-                const rect = el.getBoundingClientRect();
-                const text = textOf(el);
-                let value = 0;
-                if (editMode && text.includes("describe your edit")) value += 500;
-                if (editMode && text.includes("describe")) value += 260;
-                if (editMode && text.includes("edit")) value += 180;
-                if (!editMode && text.includes("type to imagine")) value += 520;
-                if (!editMode && text.includes("imagine")) value += 300;
-                if (!editMode && text.includes("ask grok")) value += 220;
-                if (!editMode && text.includes("ask anything")) value += 180;
-                if (text.includes("type")) value += 80;
-                if (el.isContentEditable) value += 80;
-                if (el.getAttribute("role") === "textbox") value += 50;
-                if (rect.bottom >= window.innerHeight - 260) value += 160;
-                if (el.closest("aside, nav, header")) value -= 240;
-                if (rect.width < 180) value -= 80;
-                return value;
-              };
-              candidates.sort((left, right) => score(right) - score(left));
-              const target = candidates[0];
-              if (!(target instanceof HTMLElement) || score(target) < 120) {
-                return false;
-              }
-              target.focus();
-              if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
-                target.value = prompt;
-                target.dispatchEvent(new Event("input", { bubbles: true }));
-                target.dispatchEvent(new Event("change", { bubbles: true }));
-                return true;
-              }
-              document.execCommand("selectAll", false);
-              document.execCommand("insertText", false, prompt);
-              target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
-              return true;
-            }
-            """,
-            {"prompt": prompt, "editMode": edit_mode},
-        )
-        if filled:
-            await page.wait_for_timeout(300)
+        for attempt in range(3):
+            filled = await page.evaluate(
+                r"""
+                ({ prompt, editMode }) => {
+                  const isVisible = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                      rect.width >= 120 &&
+                      rect.height >= 18 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity || "1") > 0.05
+                    );
+                  };
+                  const textOf = (el) => [
+                    el.getAttribute("data-placeholder") || "",
+                    el.getAttribute("aria-label") || "",
+                    el.getAttribute("placeholder") || "",
+                    el.innerText || "",
+                  ].join(" ").toLowerCase();
+                  const candidates = Array.from(
+                    document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
+                  ).filter(isVisible);
+                  const score = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = textOf(el);
+                    let value = 0;
+                    if (editMode && text.includes("describe your edit")) value += 500;
+                    if (editMode && text.includes("describe")) value += 260;
+                    if (editMode && text.includes("edit")) value += 180;
+                    if (!editMode && text.includes("type to imagine")) value += 520;
+                    if (!editMode && text.includes("imagine")) value += 300;
+                    if (!editMode && text.includes("ask grok")) value += 220;
+                    if (!editMode && text.includes("ask anything")) value += 180;
+                    if (text.includes("type")) value += 80;
+                    if (el.isContentEditable) value += 80;
+                    if (el.getAttribute("role") === "textbox") value += 50;
+                    if (rect.bottom >= window.innerHeight - 260) value += 160;
+                    if (el.closest("aside, nav, header")) value -= 240;
+                    if (rect.width < 180) value -= 80;
+                    return value;
+                  };
+                  candidates.sort((left, right) => score(right) - score(left));
+                  const target = candidates[0];
+                  if (!(target instanceof HTMLElement) || score(target) < 120) {
+                    return false;
+                  }
+                  target.focus();
+                  target.click?.();
+                  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+                    target.value = prompt;
+                    target.dispatchEvent(new Event("input", { bubbles: true }));
+                    target.dispatchEvent(new Event("change", { bubbles: true }));
+                    return true;
+                  }
+                  target.textContent = "";
+                  document.execCommand("selectAll", false);
+                  document.execCommand("insertText", false, prompt);
+                  if (!target.innerText?.trim()) {
+                    target.textContent = prompt;
+                  }
+                  target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: prompt }));
+                  return true;
+                }
+                """,
+                {"prompt": prompt, "editMode": edit_mode},
+            )
+            if filled:
+                await page.wait_for_timeout(250)
+            if await self._prompt_present(page, prompt):
+                return
+            with suppress(Exception):
+                await page.keyboard.press("Escape")
+            await page.wait_for_timeout(250)
 
-        prompt_present = await page.evaluate(
-            r"""
-            (prompt) => {
-              const expected = prompt.trim().slice(0, 80).toLowerCase();
-              if (!expected) return true;
-              const fields = Array.from(
-                document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
-              );
-              return fields.some((el) => {
-                const value = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
-                  ? el.value
-                  : el.innerText;
-                return (value || "").trim().toLowerCase().includes(expected);
-              });
-            }
-            """,
-            prompt,
-        )
-        if not prompt_present:
+        with suppress(Exception):
             await self._fill_prompt(page, placeholder_selectors, prompt)
+        if not await self._prompt_present(page, prompt):
+            raise RuntimeError("Grok prompt field did not retain the requested prompt text.")
 
     async def _click_submit_fallback(self, page: Page) -> bool:
         return bool(
@@ -1534,7 +1551,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         quality=str(quality) if quality else None,
                         duration=duration,
                     ),
-                    timeout=150,
+                    timeout=180 if video_mode == "image_to_video" else 150,
                 )
                 self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
                 media_urls: list[str] = []

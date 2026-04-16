@@ -268,11 +268,31 @@ class BaseAutomationProvider(ABC):
         tag_name = await locator.evaluate("(element) => element.tagName.toLowerCase()")
         content_editable = await locator.evaluate("(element) => element.isContentEditable")
         if tag_name in {"textarea", "input"}:
-            await locator.fill(value)
+            await locator.fill(value, timeout=5000)
             return
         if content_editable:
             with suppress(Exception):
-                await locator.click()
+                await locator.click(timeout=2000)
+            try:
+                is_active = await locator.evaluate("el => el === document.activeElement")
+            except Exception:
+                is_active = False
+            if not is_active:
+                with suppress(Exception):
+                    await locator.evaluate(
+                        """
+                        (el) => {
+                          if (!(el instanceof HTMLElement)) return false;
+                          el.focus();
+                          const selection = window.getSelection();
+                          const range = document.createRange();
+                          range.selectNodeContents(el);
+                          selection?.removeAllRanges();
+                          selection?.addRange(range);
+                          return el === document.activeElement;
+                        }
+                        """
+                    )
             try:
                 is_active = await locator.evaluate("el => el === document.activeElement")
             except Exception:
@@ -281,11 +301,31 @@ class BaseAutomationProvider(ABC):
                 with suppress(Exception):
                     await page.keyboard.press("Escape")
                 with suppress(Exception):
-                    await locator.click(force=True)
+                    await locator.click(force=True, timeout=2000)
+            try:
+                is_active = await locator.evaluate("el => el === document.activeElement")
+            except Exception:
+                is_active = False
+            if not is_active:
+                with suppress(Exception):
+                    await locator.evaluate(
+                        """
+                        (el, prompt) => {
+                          if (!(el instanceof HTMLElement)) return false;
+                          el.focus();
+                          el.textContent = '';
+                          document.execCommand('insertText', false, prompt);
+                          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+                          return true;
+                        }
+                        """,
+                        value,
+                    )
+                return
             await page.keyboard.press("Control+A")
             await page.keyboard.type(value)
             return
-        await locator.fill(value)
+        await locator.fill(value, timeout=5000)
 
     async def _extract_media_urls(self, page: Page, target: str) -> list[str]:
         if target == "image":
