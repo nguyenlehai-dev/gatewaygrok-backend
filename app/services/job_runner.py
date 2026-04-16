@@ -15,6 +15,8 @@ from app.services.settings_service import settings_service
 
 logger = logging.getLogger("uvicorn.error")
 
+JOB_TIMEOUT_SECONDS = 20 * 60
+
 
 def _emit_runtime_log(message: str) -> None:
     print(message, flush=True)
@@ -32,6 +34,9 @@ def _friendly_job_error(exc: Exception) -> str | None:
     error_name = type(exc).__name__
     message = str(exc).strip()
     lowered = message.lower()
+
+    if error_name == "TimeoutError" and not message:
+        return "The automation job exceeded the safety timeout and was stopped. Please retry with a shorter duration or a less restrictive prompt."
 
     if error_name in {"ContentPolicyBlockedError", "SubmitButtonDisabledError", "InvalidVideoOutputError"}:
         return message
@@ -158,7 +163,10 @@ class JobRunner:
                     f"profile_limit={self.profile_limits.get(profile.id, max(profile.concurrency_limit, 1))}"
                 )
                 try:
-                    result = await provider.run(profile, profile.proxy, job, automation_settings)
+                    result = await asyncio.wait_for(
+                        provider.run(profile, profile.proxy, job, automation_settings),
+                        timeout=JOB_TIMEOUT_SECONDS,
+                    )
                     if job.target.value in {"image", "video"} and not result.get("media_urls"):
                         raise RuntimeError(f"No media output captured for {job.target.value} job")
                     job.status = JobStatus.SUCCEEDED

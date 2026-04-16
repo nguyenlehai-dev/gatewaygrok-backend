@@ -1205,8 +1205,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 continue
         return False
 
-    def _quality_candidates(self, quality: str) -> list[str]:
+    def _quality_candidates(self, quality: str, *, media_target: str = "image") -> list[str]:
         value = str(quality).strip().lower()
+        if media_target != "video":
+            return [quality, quality.title(), quality.upper()]
         aliases = {
             "low": ["360p", "low"],
             "medium": ["480p", "medium", "standard"],
@@ -1605,6 +1607,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         ratio: str | None = None,
         quality: str | None = None,
         duration: int | str | None = None,
+        media_target: str = "image",
     ) -> dict:
         applied: dict[str, str | int] = {}
         requested: dict[str, str | int] = {}
@@ -1638,7 +1641,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         if quality:
             quality_value = str(quality).strip()
-            quality_candidates = self._quality_candidates(quality_value)
+            quality_candidates = self._quality_candidates(quality_value, media_target=media_target)
             if await self._try_click_matching_option(page, quality_candidates):
                 applied["quality"] = quality_value
             elif await self._try_open_dropdown(page, ["Quality"]):
@@ -1649,10 +1652,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if duration is not None and str(duration).strip():
             duration_value = str(duration).strip()
             duration_candidates = [
-                duration_value,
                 f"{duration_value}s",
                 f"{duration_value} sec",
                 f"{duration_value} seconds",
+                duration_value,
             ]
             if await self._try_click_matching_option(page, duration_candidates):
                 applied["duration"] = duration_value
@@ -2191,6 +2194,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     ratio=ratio,
                     quality=quality,
                     duration=duration,
+                    media_target="video",
                 )
 
                 if video_mode == "image_to_video":
@@ -2286,6 +2290,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             page,
             ratio=ratio,
             quality=quality,
+            media_target="image",
         )
 
         await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
