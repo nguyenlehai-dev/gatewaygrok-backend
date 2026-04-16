@@ -270,6 +270,37 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.goto(target_post_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(1200)
 
+    async def _page_lost_result_context(self, page: Page, submitted_post_url: str | None) -> bool:
+        target_post_url = self._extract_post_url(submitted_post_url)
+        current_post_url = self._extract_post_url(page.url)
+        if target_post_url and current_post_url == target_post_url:
+            return False
+        details = await page.evaluate(
+            r"""
+            () => {
+              const headingText = Array.from(document.querySelectorAll("h1, h2, h3"))
+                .map((node) => (node.textContent || "").trim().toLowerCase())
+                .filter(Boolean)
+                .slice(0, 10);
+              return {
+                headingText,
+                bodyText: (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 500).toLowerCase(),
+              };
+            }
+            """
+        )
+        heading_text = " ".join(str(item) for item in (details or {}).get("headingText") or [])
+        body_text = str((details or {}).get("bodyText") or "")
+        return (
+            "/imagine/post/" not in str(page.url or "")
+            and ("featured templates" in heading_text or "discover" in heading_text or "type to imagine" in body_text)
+        )
+
+    async def _capture_ready_snapshot(self, page: Page, profile: Profile, job: AutomationJob, suffix: str) -> None:
+        with suppress(Exception):
+            path = await self._capture_debug(page, profile_storage.output_dir(profile.id), f"{job.id}-{suffix}")
+            self._log_job_step(job, f"snapshot_saved path={path}")
+
     def _coerce_image_to_video_prompt(self, prompt: str) -> str:
         normalized = " ".join((prompt or "").split()).strip()
         if not normalized:
@@ -2196,6 +2227,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 hidden_message = await self._detect_hidden_media_block(page, suffix_label)
                 if hidden_message:
                     raise self._hidden_result_exception(job, suffix_label, hidden_message)
+                runtime = self._read_job_runtime_payload(job)
+                if runtime.get("video_ready_detected") and await self._page_lost_result_context(page, submitted_post_url):
+                    raise self._vanished_result_exception(job, suffix_label, page_url=page.url)
                 await page.wait_for_timeout(delay_ms)
                 continue
 
@@ -2474,6 +2508,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                             self._log_job_step(job, f"make_video_fallback_unavailable reason={type(exc).__name__}")
                             media_urls = []
                     if isinstance(state, dict) and state.get("hasVideo"):
+                        await self._capture_ready_snapshot(page, profile, job, "video-ready")
                         self._log_job_step(job, "direct_video_download_preferred")
                         try:
                             downloaded_media = await asyncio.wait_for(
@@ -2572,7 +2607,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         if hidden_message:
                             raise self._hidden_result_exception(job, "video", hidden_message)
                         runtime = self._read_job_runtime_payload(job)
-                        if runtime.get("video_ready_detected"):
+                        if runtime.get("video_ready_detected") and await self._page_lost_result_context(page, submitted_post_url):
                             raise self._vanished_result_exception(job, "video", page_url=page.url)
                         if video_mode == "image_to_video":
                             raise InvalidVideoOutputError(
