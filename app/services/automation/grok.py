@@ -29,6 +29,10 @@ class InvalidVideoOutputError(RuntimeError):
     """Raised when a video generation flow returns non-video output."""
 
 
+class TransientVideoResultLostError(RuntimeError):
+    """Raised when Grok briefly exposes a result, then hides it before download completes."""
+
+
 class GrokAutomationProvider(BaseAutomationProvider):
     provider_name = "grok"
     start_url = "https://grok.com/"
@@ -48,6 +52,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         stage: str | None = None,
         blocked: bool | None = None,
         notice: str | None = None,
+        extra: dict | None = None,
     ) -> None:
         runtime: dict = {}
         if progress_percent is not None:
@@ -60,6 +65,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
             runtime["blocked"] = bool(blocked)
         if notice:
             runtime["provider_notice"] = notice
+        if isinstance(extra, dict):
+            runtime.update({key: value for key, value in extra.items() if value is not None})
 
         if not runtime:
             return
@@ -76,6 +83,53 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 db_job.result_payload = payload
                 db.add(db_job)
                 db.commit()
+
+    def _read_job_runtime_payload(self, job: AutomationJob) -> dict:
+        with suppress(Exception):
+            with SessionLocal() as db:
+                db_job = db.get(AutomationJob, job.id)
+                if not db_job:
+                    return {}
+                return dict((db_job.result_payload or {}).get("runtime") or {})
+        return {}
+
+    def _mark_video_result_detected(self, job: AutomationJob, submitted_post_url: str | None = None) -> None:
+        self._update_job_runtime_payload(
+            job,
+            message="Grok exposed a video result. Downloading before it disappears...",
+            stage="ready",
+            blocked=False,
+            extra={
+                "video_ready_detected": True,
+                "submitted_post_url": self._extract_post_url(submitted_post_url),
+            },
+        )
+
+    def _hidden_result_exception(self, job: AutomationJob, target: str, hidden_message: str) -> RuntimeError:
+        runtime = self._read_job_runtime_payload(job)
+        if runtime.get("video_ready_detected"):
+            transient_message = (
+                f"Grok briefly exposed a {target} result, but it disappeared before download completed. "
+                "Please retry this job."
+            )
+            self._update_job_runtime_payload(
+                job,
+                message=transient_message,
+                stage="vanished",
+                blocked=False,
+                notice=hidden_message,
+                extra={"video_ready_detected": True},
+            )
+            return TransientVideoResultLostError(transient_message)
+
+        self._update_job_runtime_payload(
+            job,
+            blocked=True,
+            notice=hidden_message,
+            message=hidden_message,
+            stage="hidden",
+        )
+        return ContentPolicyBlockedError(hidden_message)
 
     def _extract_post_url(self, value: str | None) -> str | None:
         if not value:
@@ -1750,30 +1804,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
         timeout_ms: int = 480000,
         poll_ms: int = 4000,
         baseline_urls: list[str] | None = None,
+        submitted_post_url: str | None = None,
     ) -> list[str]:
         elapsed = 0
         download_without_video_hits = 0
         while elapsed < timeout_ms:
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
-                self._update_job_runtime_payload(
-                    job,
-                    blocked=True,
-                    notice=blocked_message,
-                    message=blocked_message,
-                    stage="blocked",
-                )
                 raise ContentPolicyBlockedError(blocked_message)
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
-                self._update_job_runtime_payload(
-                    job,
-                    blocked=True,
-                    notice=hidden_message,
-                    message=hidden_message,
-                    stage="hidden",
-                )
-                raise ContentPolicyBlockedError(hidden_message)
+                raise self._hidden_result_exception(job, "video", hidden_message)
 
             media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
             if not media_urls:
@@ -1786,6 +1827,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             state = await self._video_generation_state(page)
             if isinstance(state, dict):
                 if state.get("hasVideo") or state.get("htmlHasVideoUrl"):
+                    self._mark_video_result_detected(job, submitted_post_url)
                     self._log_job_step(job, "video_ready_download_visible")
                     return []
                 if state.get("generating"):
@@ -2123,7 +2165,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     raise ContentPolicyBlockedError(blocked_message)
                 hidden_message = await self._detect_hidden_media_block(page, suffix_label)
                 if hidden_message:
-                    raise ContentPolicyBlockedError(hidden_message)
+                    raise self._hidden_result_exception(job, suffix_label, hidden_message)
                 await page.wait_for_timeout(delay_ms)
                 continue
 
@@ -2167,14 +2209,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         except RuntimeError as exc:
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
-                self._update_job_runtime_payload(
-                    job,
-                    blocked=True,
-                    notice=hidden_message,
-                    message=hidden_message,
-                    stage="hidden",
-                )
-                raise ContentPolicyBlockedError(hidden_message) from exc
+                raise self._hidden_result_exception(job, "video", hidden_message) from exc
             raise
         await make_video_button.click()
         self._log_job_step(job, "make_video_clicked")
@@ -2194,6 +2229,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             job,
             timeout_ms=480000,
             baseline_urls=baseline_urls,
+            submitted_post_url=submitted_post_url,
         )
         if media_urls:
             downloaded = await self._download_file(
@@ -2254,6 +2290,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             job,
             timeout_ms=480000,
             baseline_urls=baseline_urls,
+            submitted_post_url=submitted_post_url,
         )
         media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
         if media_urls:
@@ -2380,6 +2417,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         job,
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
+                        submitted_post_url=submitted_post_url,
                     )
                     if video_mode == "image_to_video" and media_urls:
                         scoped_media_urls = self._reject_unscoped_image_to_video_urls(media_urls, submitted_post_url)
@@ -2502,14 +2540,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     if not media_urls:
                         hidden_message = await self._detect_hidden_media_block(page, "video")
                         if hidden_message:
-                            self._update_job_runtime_payload(
-                                job,
-                                blocked=True,
-                                notice=hidden_message,
-                                message=hidden_message,
-                                stage="hidden",
-                            )
-                            raise ContentPolicyBlockedError(hidden_message)
+                            raise self._hidden_result_exception(job, "video", hidden_message)
                         if video_mode == "image_to_video":
                             raise InvalidVideoOutputError(
                                 "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
