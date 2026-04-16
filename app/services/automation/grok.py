@@ -54,6 +54,33 @@ class GrokAutomationProvider(BaseAutomationProvider):
             return None
         return match.group(1).lower()
 
+    def _filter_video_urls_for_submitted_post(
+        self,
+        media_urls: list[str],
+        submitted_post_url: str | None,
+    ) -> list[str]:
+        post_id = self._extract_post_id(submitted_post_url)
+        if not post_id:
+            return media_urls
+
+        local_or_data_urls: list[str] = []
+        remote_urls: list[str] = []
+        for url in media_urls:
+            normalized = str(url).strip()
+            if not normalized:
+                continue
+            if normalized.startswith(("http://", "https://")):
+                remote_urls.append(normalized)
+            else:
+                local_or_data_urls.append(normalized)
+
+        exact_matches = [url for url in remote_urls if post_id in url.lower()]
+        if exact_matches:
+            return exact_matches + local_or_data_urls
+        if local_or_data_urls:
+            return local_or_data_urls
+        return []
+
     def _begin_video_network_capture(self, page: Page) -> None:
         captured: list[str] = []
 
@@ -1492,6 +1519,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             exact_matches = [url for url in normalized if post_id in url.lower()]
             if exact_matches:
                 return exact_matches
+            return []
         return normalized
 
     async def _wait_for_video_ready(
@@ -1968,6 +1996,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                     )
+                    media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
                     post_video_urls = await self._extract_submitted_post_video_urls(page, submitted_post_url)
                     if isinstance(baseline_video_urls, list):
                         post_video_urls = self._filter_new_media_urls(post_video_urls, baseline_video_urls)
@@ -1996,12 +2025,14 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
                         network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
+                    network_video_urls = self._filter_video_urls_for_submitted_post(network_video_urls, submitted_post_url)
                     if network_video_urls and not media_urls:
                         media_urls = network_video_urls
                     if not media_urls:
                         media_urls = await self._extract_ready_video_urls(page)
                         if isinstance(baseline_video_urls, list):
                             media_urls = self._filter_new_media_urls(media_urls, baseline_video_urls)
+                        media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
                     if not media_urls:
                         self._log_job_step(job, "direct_video_download_start")
                         try:
@@ -2018,6 +2049,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                             self._wait_for_media(page, "video"),
                             timeout=150,
                         )
+                        media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
                     if not media_urls and video_mode == "image_to_video":
                         self._log_job_step(job, "image_result_to_video_fallback_start")
                         try:
