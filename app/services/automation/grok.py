@@ -1040,6 +1040,44 @@ class GrokAutomationProvider(BaseAutomationProvider):
             """
         )
 
+    async def _extract_ready_video_urls(self, page: Page) -> list[str]:
+        urls = await page.evaluate(
+            r"""
+            () => {
+              const values = [];
+              const push = (value) => {
+                if (typeof value === "string" && value.trim()) {
+                  values.push(value.trim());
+                }
+              };
+
+              for (const video of Array.from(document.querySelectorAll("video"))) {
+                push(video.currentSrc || video.src || "");
+                for (const source of Array.from(video.querySelectorAll("source"))) {
+                  push(source.src || "");
+                }
+              }
+
+              for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
+                push(anchor.href || "");
+              }
+
+              for (const media of Array.from(document.querySelectorAll("[src], [data-url], [data-href]"))) {
+                if (!(media instanceof HTMLElement)) continue;
+                push(media.getAttribute("src") || "");
+                push(media.getAttribute("data-url") || "");
+                push(media.getAttribute("data-href") || "");
+              }
+
+              return values;
+            }
+            """
+        )
+        if not isinstance(urls, list):
+            return []
+        normalized = [str(url).strip() for url in urls if str(url).strip()]
+        return self._normalize_media_urls(normalized, "video")
+
     async def _wait_for_video_ready(
         self,
         page: Page,
@@ -1055,6 +1093,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 raise ContentPolicyBlockedError(blocked_message)
 
             media_urls = self._normalize_media_urls(await super()._extract_media_urls(page, "video"), "video")
+            if not media_urls:
+                media_urls = await self._extract_ready_video_urls(page)
             if media_urls:
                 self._log_job_step(job, f"video_ready_media_detected media_count={len(media_urls)}")
                 return media_urls
@@ -1484,6 +1524,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     job,
                     timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                 )
+                if not media_urls:
+                    media_urls = await self._extract_ready_video_urls(page)
                 if not media_urls:
                     self._log_job_step(job, "direct_video_download_start")
                     try:
