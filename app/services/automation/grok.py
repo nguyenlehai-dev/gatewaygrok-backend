@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import re
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -65,12 +66,14 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
     async def _prompt_present(self, page: Page, prompt: str) -> bool:
+        normalized_prompt = " ".join((prompt or "").split()).strip().lower()
+        prefix = normalized_prompt[:32]
+        words = [word for word in re.findall(r"[0-9a-zA-Z_]+", normalized_prompt) if len(word) >= 3][:6]
         return bool(
             await page.evaluate(
                 r"""
-                (prompt) => {
-                  const expected = prompt.trim().slice(0, 80).toLowerCase();
-                  if (!expected) return true;
+                ({ prefix, words }) => {
+                  if (!prefix && (!words || !words.length)) return true;
                   const fields = Array.from(
                     document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
                   );
@@ -78,11 +81,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     const value = el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
                       ? el.value
                       : el.innerText;
-                    return (value || "").trim().toLowerCase().includes(expected);
+                    const normalized = (value || "").replace(/\s+/g, " ").trim().toLowerCase();
+                    if (!normalized) return false;
+                    if (prefix && normalized.includes(prefix)) return true;
+                    const matchedWords = (words || []).filter((word) => normalized.includes(word));
+                    return matchedWords.length >= Math.min(3, (words || []).length || 0);
                   });
                 }
                 """,
-                prompt,
+                {"prefix": prefix, "words": words},
             )
         )
 
@@ -337,6 +344,45 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
     async def _extract_media_urls(self, page: Page, target: str) -> list[str]:
+        if target == "video":
+            video_urls = await page.evaluate(
+                r"""
+                () => {
+                  const visible = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                      rect.width >= 120 &&
+                      rect.height >= 120 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      rect.top < window.innerHeight &&
+                      rect.left < window.innerWidth &&
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity || "1") > 0.05
+                    );
+                  };
+                  const candidates = Array.from(document.querySelectorAll("video"))
+                    .filter(visible)
+                    .map((video) => {
+                      const rect = video.getBoundingClientRect();
+                      return {
+                        src: video.currentSrc || video.src || "",
+                        score: Math.round(rect.width * rect.height) + Math.round(rect.height * 10),
+                      };
+                    })
+                    .filter((item) => item.src);
+                  candidates.sort((left, right) => right.score - left.score);
+                  return candidates.map((item) => item.src);
+                }
+                """
+            )
+            if isinstance(video_urls, list) and any(str(url).strip() for url in video_urls):
+                return [str(url).strip() for url in video_urls if str(url).strip()]
+            return await super()._extract_media_urls(page, target)
+
         if target != "image":
             return await super()._extract_media_urls(page, target)
 
@@ -369,6 +415,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     continue
             seen.add(normalized)
             filtered.append(normalized)
+        if target == "video":
+            preferred = [
+                url
+                for url in filtered
+                if "share-videos/" in url.lower() or "generated_video" in url.lower()
+            ]
+            if preferred:
+                filtered = preferred
+            if len(filtered) > 4:
+                filtered = filtered[:4]
         return filtered
 
     async def _detect_content_policy_block(self, page: Page, target: str) -> str | None:
