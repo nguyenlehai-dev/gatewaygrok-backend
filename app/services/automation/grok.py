@@ -45,6 +45,38 @@ class GrokAutomationProvider(BaseAutomationProvider):
             return None
         return text
 
+    def _begin_video_network_capture(self, page: Page) -> None:
+        captured: list[str] = []
+
+        def _handler(response) -> None:
+            with suppress(Exception):
+                url = str(response.url or "").strip()
+                lowered = url.lower()
+                if not url:
+                    return
+                if ".mp4" not in lowered and "share-videos/" not in lowered and "generated_video" not in lowered:
+                    return
+                if url not in captured:
+                    captured.append(url)
+
+        setattr(page, "_grok_video_capture_urls", captured)
+        setattr(page, "_grok_video_capture_handler", _handler)
+        page.on("response", _handler)
+
+    def _read_video_network_capture(self, page: Page) -> list[str]:
+        urls = getattr(page, "_grok_video_capture_urls", [])
+        if not isinstance(urls, list):
+            return []
+        return self._normalize_media_urls([str(url).strip() for url in urls if str(url).strip()], "video")
+
+    def _stop_video_network_capture(self, page: Page) -> None:
+        handler = getattr(page, "_grok_video_capture_handler", None)
+        if handler is not None:
+            with suppress(Exception):
+                page.remove_listener("response", handler)
+        with suppress(Exception):
+            setattr(page, "_grok_video_capture_handler", None)
+
     async def _wait_for_new_post_url(self, page: Page, previous_url: str | None, *, timeout_ms: int = 90000) -> str | None:
         previous_post_url = self._extract_post_url(previous_url)
         elapsed = 0
@@ -1527,6 +1559,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 baseline_urls = await self._extract_ready_video_urls(page)
                 if baseline_urls:
                     option_state["baseline_video_urls"] = baseline_urls
+                self._begin_video_network_capture(page)
                 submitted_from_url = page.url
                 await self._click_submit_button(page, submit, flow_label=video_mode.replace("_", "-"))
                 await page.wait_for_timeout(1500)
@@ -1799,6 +1832,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                     baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                 )
+                network_video_urls = self._read_video_network_capture(page)
+                if isinstance(baseline_video_urls, list):
+                    network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
+                if network_video_urls:
+                    media_urls = network_video_urls
                 if not media_urls:
                     media_urls = await self._extract_ready_video_urls(page)
                     if isinstance(baseline_video_urls, list):
@@ -1861,6 +1899,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     "media_urls": media_urls,
                     "submitted_post_url": submitted_post_url,
                 }
+            finally:
+                self._stop_video_network_capture(page)
 
         option_state = await self._open_imagine_image_flow(
             page,
