@@ -1884,6 +1884,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
         prompt: str,
     ) -> list[str]:
         self._log_job_step(job, "image_result_to_video_start")
+        previous_url = page.url
+        baseline_urls = await self._extract_ready_video_urls(page)
         if not await self._click_composer_video_mode(page):
             self._log_job_step(job, "image_result_to_video_no_video_button")
             return []
@@ -1901,19 +1903,44 @@ class GrokAutomationProvider(BaseAutomationProvider):
         await page.wait_for_timeout(1500)
 
         self._log_job_step(job, "image_result_to_video_submitted")
-        media_urls = await self._wait_for_video_ready(page, job, timeout_ms=480000)
+        submitted_post_url = await self._wait_for_new_post_url(page, previous_url, timeout_ms=90000)
+        if submitted_post_url:
+            self._log_job_step(job, f"image_result_to_video_post_url post={submitted_post_url}")
+            with suppress(Exception):
+                await page.goto(submitted_post_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(1200)
+
+        post_video_urls = await self._extract_submitted_post_video_urls(page, submitted_post_url)
+        post_video_urls = self._filter_new_media_urls(post_video_urls, baseline_urls)
+        if post_video_urls:
+            self._log_job_step(job, f"image_result_to_video_post_video media_count={len(post_video_urls)}")
+            return post_video_urls
+
+        media_urls = await self._wait_for_video_ready(
+            page,
+            job,
+            timeout_ms=480000,
+            baseline_urls=baseline_urls,
+        )
+        media_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
         if media_urls:
             return media_urls
-        media_urls = await asyncio.wait_for(
-            self._download_file(page, profile, job, "video"),
-            timeout=180,
-        )
+        try:
+            media_urls = await asyncio.wait_for(
+                self._download_file(page, profile, job, "video"),
+                timeout=180,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_job_step(job, f"image_result_to_video_download_unavailable reason={type(exc).__name__}")
+            media_urls = []
         if media_urls:
             self._log_job_step(job, f"image_result_to_video_download_done media_count={len(media_urls)}")
             return media_urls
 
         self._log_job_step(job, "image_result_to_video_wait_media")
-        return await asyncio.wait_for(self._wait_for_media(page, "video"), timeout=150)
+        media_urls = await asyncio.wait_for(self._wait_for_media(page, "video"), timeout=150)
+        media_urls = self._filter_new_media_urls(media_urls, baseline_urls)
+        return self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
 
     async def inspect_session(
         self,
