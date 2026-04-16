@@ -1011,6 +1011,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
             upload_input = await self._first_visible(page, ["input[type='file']"])
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2000)
+            if video_mode == "image_to_video":
+                with suppress(Exception):
+                    await self._click_composer_video_mode(page)
+                with suppress(Exception):
+                    await self._select_video_submode(page, video_mode)
 
         option_state = await self._apply_generation_options(
             page,
@@ -1019,10 +1024,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
             duration=duration,
         )
 
-        await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
+        await self._fill_grok_prompt(page, prompt, edit_mode=False)
         if video_mode == "image_to_video":
             with suppress(Exception):
                 await self._click_composer_video_mode(page)
+            await self._fill_grok_prompt(page, prompt, edit_mode=False)
 
         try:
             submit = await self._find_submit_button(page)
