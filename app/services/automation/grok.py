@@ -86,9 +86,57 @@ class GrokAutomationProvider(BaseAutomationProvider):
             )
         )
 
-    async def _ensure_video_generation_state(self, page: Page, prompt: str) -> None:
+    async def _prepare_image_to_video_form(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None,
+        *,
+        reset_page: bool = False,
+    ) -> None:
+        if reset_page:
+            await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+            await page.wait_for_timeout(1200)
+
+        video_mode_button = await self._wait_for_action_button(
+            page,
+            [
+                "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
+                "[aria-label='Generation mode'] >> text=Video",
+            ],
+            attempts=8,
+            delay_ms=1200,
+        )
+        if await video_mode_button.get_attribute("aria-checked") != "true":
+            await video_mode_button.click(timeout=3000)
+            await page.wait_for_timeout(600)
+
+        with suppress(Exception):
+            await self._select_video_submode(page, "image_to_video")
+        with suppress(Exception):
+            await self._click_composer_video_mode(page)
+
+        if source_asset_path:
+            source_file = Path(source_asset_path)
+            if source_file.exists():
+                upload_input = await self._first_visible(page, ["input[type='file']"])
+                await upload_input.set_input_files(str(source_file))
+                await page.wait_for_timeout(1800)
+                with suppress(Exception):
+                    await self._select_video_submode(page, "image_to_video")
+                with suppress(Exception):
+                    await self._click_composer_video_mode(page)
+
+        await self._fill_grok_prompt(page, prompt, edit_mode=False)
+
+    async def _ensure_video_generation_state(
+        self,
+        page: Page,
+        prompt: str,
+        source_asset_path: str | None = None,
+    ) -> None:
         expected = prompt.strip().lower()[:80]
-        for _ in range(3):
+        for attempt in range(4):
             state = await page.evaluate(
                 r"""
                 (expected) => {
@@ -140,6 +188,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 and state.get("promptPresent")
             ):
                 return
+            if isinstance(state, dict) and state.get("editMode") and attempt >= 1:
+                await self._prepare_image_to_video_form(
+                    page,
+                    prompt,
+                    source_asset_path,
+                    reset_page=True,
+                )
+                await page.wait_for_timeout(800)
+                continue
             with suppress(Exception):
                 await self._click_composer_video_mode(page)
             with suppress(Exception):
@@ -147,7 +204,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if await video_mode_button.count() > 0:
                     await video_mode_button.click(timeout=2000)
                     await page.wait_for_timeout(500)
-            await self._fill_grok_prompt(page, prompt, edit_mode=False)
+            if source_asset_path and attempt >= 2:
+                await self._prepare_image_to_video_form(
+                    page,
+                    prompt,
+                    source_asset_path,
+                    reset_page=True,
+                )
+            else:
+                await self._fill_grok_prompt(page, prompt, edit_mode=False)
             await page.wait_for_timeout(600)
         raise SubmitButtonDisabledError(
             "Grok stayed in image-edit mode instead of video mode for this image-to-video job."
@@ -1265,12 +1330,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     duration=duration,
                 )
 
-                await self._fill_grok_prompt(page, prompt, edit_mode=False)
                 if video_mode == "image_to_video":
-                    with suppress(Exception):
-                        await self._click_composer_video_mode(page)
+                    await self._prepare_image_to_video_form(page, prompt, source_asset_path, reset_page=False)
+                    await self._ensure_video_generation_state(page, prompt, source_asset_path)
+                else:
                     await self._fill_grok_prompt(page, prompt, edit_mode=False)
-                    await self._ensure_video_generation_state(page, prompt)
 
                 try:
                     submit = await self._find_submit_button(page)
