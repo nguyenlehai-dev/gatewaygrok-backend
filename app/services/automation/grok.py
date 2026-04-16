@@ -469,6 +469,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 filtered = filtered[:12]
         return filtered
 
+    def _filter_new_media_urls(self, media_urls: list[str], baseline_urls: list[str] | None) -> list[str]:
+        if not baseline_urls:
+            return media_urls
+        baseline = {str(url).strip() for url in baseline_urls if str(url).strip()}
+        fresh = [url for url in media_urls if str(url).strip() and str(url).strip() not in baseline]
+        return fresh
+
     async def _detect_content_policy_block(self, page: Page, target: str) -> str | None:
         text = await page.evaluate(
             r"""
@@ -1336,6 +1343,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         *,
         timeout_ms: int = 480000,
         poll_ms: int = 4000,
+        baseline_urls: list[str] | None = None,
     ) -> list[str]:
         elapsed = 0
         while elapsed < timeout_ms:
@@ -1346,6 +1354,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             media_urls = self._normalize_media_urls(await super()._extract_media_urls(page, "video"), "video")
             if not media_urls:
                 media_urls = await self._extract_ready_video_urls(page)
+            media_urls = self._filter_new_media_urls(media_urls, baseline_urls)
             if media_urls:
                 self._log_job_step(job, f"video_ready_media_detected media_count={len(media_urls)}")
                 return media_urls
@@ -1515,6 +1524,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     raise SubmitButtonDisabledError(
                         f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
                     ) from exc
+                baseline_urls = await self._extract_ready_video_urls(page)
+                if baseline_urls:
+                    option_state["baseline_video_urls"] = baseline_urls
                 submitted_from_url = page.url
                 await self._click_submit_button(page, submit, flow_label=video_mode.replace("_", "-"))
                 await page.wait_for_timeout(1500)
@@ -1775,6 +1787,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 )
                 self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
                 submitted_post_url = option_state.get("submitted_post_url") if isinstance(option_state, dict) else None
+                baseline_video_urls = option_state.get("baseline_video_urls") if isinstance(option_state, dict) else None
                 if isinstance(submitted_post_url, str) and submitted_post_url:
                     with suppress(Exception):
                         await page.goto(submitted_post_url, wait_until="domcontentloaded")
@@ -1784,9 +1797,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     page,
                     job,
                     timeout_ms=480000 if video_mode == "image_to_video" else 300000,
+                    baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                 )
                 if not media_urls:
                     media_urls = await self._extract_ready_video_urls(page)
+                    if isinstance(baseline_video_urls, list):
+                        media_urls = self._filter_new_media_urls(media_urls, baseline_video_urls)
                 if not media_urls:
                     self._log_job_step(job, "direct_video_download_start")
                     try:
