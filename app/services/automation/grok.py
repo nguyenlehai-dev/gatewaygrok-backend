@@ -364,18 +364,40 @@ class GrokAutomationProvider(BaseAutomationProvider):
                       Number(style.opacity || "1") > 0.05
                     );
                   };
-                  const candidates = Array.from(document.querySelectorAll("video"))
-                    .filter(visible)
-                    .map((video) => {
-                      const rect = video.getBoundingClientRect();
-                      return {
-                        src: video.currentSrc || video.src || "",
-                        score: Math.round(rect.width * rect.height) + Math.round(rect.height * 10),
-                      };
-                    })
-                    .filter((item) => item.src);
-                  candidates.sort((left, right) => right.score - left.score);
-                  return candidates.map((item) => item.src);
+                  const collected = [];
+                  const push = (src, score) => {
+                    if (typeof src !== "string" || !src.trim()) return;
+                    collected.push({ src: src.trim(), score });
+                  };
+
+                  for (const video of Array.from(document.querySelectorAll("video")).filter(visible)) {
+                    const rect = video.getBoundingClientRect();
+                    const score = Math.round(rect.width * rect.height) + Math.round(rect.height * 10);
+                    push(video.currentSrc || video.src || "", score);
+                    for (const source of Array.from(video.querySelectorAll("source"))) {
+                      push(source.src || "", score - 1);
+                    }
+                  }
+
+                  const mediaNodes = Array.from(
+                    document.querySelectorAll("a[href*='.mp4'], a[href*='share-videos/'], [src*='.mp4'], [data-url*='.mp4'], [data-href*='.mp4']")
+                  );
+                  for (const node of mediaNodes) {
+                    const host = node instanceof HTMLElement ? node : node.parentElement;
+                    const visibleHost = host instanceof HTMLElement
+                      ? (visible(host) ? host : host.closest("article, section, main, div"))
+                      : null;
+                    if (!(visibleHost instanceof HTMLElement) || !visible(visibleHost)) continue;
+                    const rect = visibleHost.getBoundingClientRect();
+                    const score = Math.round(rect.width * rect.height);
+                    push(node.getAttribute?.("href") || "", score);
+                    push(node.getAttribute?.("src") || "", score);
+                    push(node.getAttribute?.("data-url") || "", score);
+                    push(node.getAttribute?.("data-href") || "", score);
+                  }
+
+                  collected.sort((left, right) => right.score - left.score);
+                  return collected.map((item) => item.src);
                 }
                 """
             )
@@ -423,8 +445,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ]
             if preferred:
                 filtered = preferred
-            if len(filtered) > 4:
-                filtered = filtered[:4]
+            if len(filtered) > 12:
+                filtered = filtered[:12]
         return filtered
 
     async def _detect_content_policy_block(self, page: Page, target: str) -> str | None:
