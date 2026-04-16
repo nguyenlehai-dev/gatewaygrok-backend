@@ -1272,6 +1272,42 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         return await self._download_file(page, profile, job, "video")
 
+    async def _promote_image_result_to_video(
+        self,
+        page: Page,
+        profile: Profile,
+        job: AutomationJob,
+        prompt: str,
+    ) -> list[str]:
+        self._log_job_step(job, "image_result_to_video_start")
+        if not await self._click_composer_video_mode(page):
+            self._log_job_step(job, "image_result_to_video_no_video_button")
+            return []
+
+        await self._fill_grok_prompt(page, prompt, edit_mode=False)
+        await self._ensure_video_generation_state(page, prompt)
+
+        submit = await self._wait_for_enabled_submit_button(
+            page,
+            "image-to-video-second-pass",
+            attempts=20,
+            delay_ms=1000,
+        )
+        await submit.click(timeout=3000)
+        await page.wait_for_timeout(1500)
+
+        self._log_job_step(job, "image_result_to_video_submitted")
+        media_urls = await asyncio.wait_for(
+            self._download_file(page, profile, job, "video"),
+            timeout=180,
+        )
+        if media_urls:
+            self._log_job_step(job, f"image_result_to_video_download_done media_count={len(media_urls)}")
+            return media_urls
+
+        self._log_job_step(job, "image_result_to_video_wait_media")
+        return await asyncio.wait_for(self._wait_for_media(page, "video"), timeout=150)
+
     async def inspect_session(
         self,
         page: Page,
@@ -1375,10 +1411,20 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         self._wait_for_media(page, "video"),
                         timeout=150,
                     )
+                if not media_urls and video_mode == "image_to_video":
+                    self._log_job_step(job, "image_result_to_video_fallback_start")
+                    try:
+                        media_urls = await self._promote_image_result_to_video(page, profile, job, prompt_text)
+                    except asyncio.TimeoutError:
+                        self._log_job_step(job, "image_result_to_video_fallback_timeout")
+                        media_urls = []
                     if media_urls:
                         output_dir = profile_storage.output_dir(profile.id)
                         localized: list[str] = []
                         for index, url in enumerate(media_urls, start=1):
+                            if not str(url).startswith(("http://", "https://", "data:")):
+                                localized.append(str(url))
+                                continue
                             target_path = output_dir / f"{job.id}-video-{index}.mp4"
                             if url.startswith("data:"):
                                 localized.append(await self._save_data_url(url, target_path))
