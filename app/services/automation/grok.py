@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from contextlib import suppress
 from pathlib import Path
@@ -28,6 +29,12 @@ class InvalidVideoOutputError(RuntimeError):
 class GrokAutomationProvider(BaseAutomationProvider):
     provider_name = "grok"
     start_url = "https://grok.com/"
+
+    def _log_job_step(self, job: AutomationJob, step: str) -> None:
+        print(
+            f"grok_job_step job_id={job.id} profile_id={job.profile_id} target={job.target.value} step={step}",
+            flush=True,
+        )
 
     async def _extract_image_candidates(self, page: Page) -> list[dict]:
         return await page.evaluate(
@@ -1235,25 +1242,51 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             if video_mode in {"text_to_video", "image_to_video"}:
-                option_state = await self._open_imagine_video_flow(
-                    page,
-                    job.prompt,
-                    source_asset_path if video_mode == "image_to_video" else None,
-                    video_mode,
-                    ratio=str(ratio) if ratio else None,
-                    quality=str(quality) if quality else None,
-                    duration=duration,
+                self._log_job_step(job, f"video_flow_open_start mode={video_mode}")
+                option_state = await asyncio.wait_for(
+                    self._open_imagine_video_flow(
+                        page,
+                        job.prompt,
+                        source_asset_path if video_mode == "image_to_video" else None,
+                        video_mode,
+                        ratio=str(ratio) if ratio else None,
+                        quality=str(quality) if quality else None,
+                        duration=duration,
+                    ),
+                    timeout=150,
                 )
+                self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
                 media_urls: list[str] = []
                 if video_mode == "image_to_video":
                     try:
-                        media_urls = await self._download_video_asset(page, profile, job)
+                        self._log_job_step(job, "make_video_download_start")
+                        media_urls = await asyncio.wait_for(
+                            self._download_video_asset(page, profile, job),
+                            timeout=180,
+                        )
+                        self._log_job_step(job, f"make_video_download_done media_count={len(media_urls)}")
                     except RuntimeError:
+                        self._log_job_step(job, "make_video_unavailable_fallback")
+                        media_urls = []
+                    except asyncio.TimeoutError:
+                        self._log_job_step(job, "make_video_download_timeout_fallback")
                         media_urls = []
                 if not media_urls:
-                    media_urls = await self._download_file(page, profile, job, "video")
+                    self._log_job_step(job, "direct_video_download_start")
+                    try:
+                        media_urls = await asyncio.wait_for(
+                            self._download_file(page, profile, job, "video"),
+                            timeout=180,
+                        )
+                    except asyncio.TimeoutError:
+                        self._log_job_step(job, "direct_video_download_timeout")
+                        media_urls = []
                 if not media_urls:
-                    media_urls = await self._wait_for_media(page, "video")
+                    self._log_job_step(job, "wait_video_media_start")
+                    media_urls = await asyncio.wait_for(
+                        self._wait_for_media(page, "video"),
+                        timeout=150,
+                    )
                     if media_urls:
                         output_dir = profile_storage.output_dir(profile.id)
                         localized: list[str] = []
