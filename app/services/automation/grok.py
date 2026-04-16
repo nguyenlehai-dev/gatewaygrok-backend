@@ -1537,6 +1537,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
                 raise ContentPolicyBlockedError(blocked_message)
+            hidden_message = await self._detect_hidden_media_block(page, "video")
+            if hidden_message:
+                raise ContentPolicyBlockedError(hidden_message)
 
             media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
             if not media_urls:
