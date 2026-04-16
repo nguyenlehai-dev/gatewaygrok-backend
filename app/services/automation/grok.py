@@ -1257,20 +1257,6 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 )
                 self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
                 media_urls: list[str] = []
-                if video_mode == "image_to_video":
-                    try:
-                        self._log_job_step(job, "make_video_download_start")
-                        media_urls = await asyncio.wait_for(
-                            self._download_video_asset(page, profile, job),
-                            timeout=180,
-                        )
-                        self._log_job_step(job, f"make_video_download_done media_count={len(media_urls)}")
-                    except RuntimeError:
-                        self._log_job_step(job, "make_video_unavailable_fallback")
-                        media_urls = []
-                    except asyncio.TimeoutError:
-                        self._log_job_step(job, "make_video_download_timeout_fallback")
-                        media_urls = []
                 if not media_urls:
                     self._log_job_step(job, "direct_video_download_start")
                     try:
