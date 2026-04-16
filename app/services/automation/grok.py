@@ -45,6 +45,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
             return None
         return text
 
+    def _extract_post_id(self, value: str | None) -> str | None:
+        post_url = self._extract_post_url(value)
+        if not post_url:
+            return None
+        match = re.search(r"/imagine/post/([0-9a-fA-F-]+)", post_url)
+        if not match:
+            return None
+        return match.group(1).lower()
+
     def _begin_video_network_capture(self, page: Page) -> None:
         captured: list[str] = []
 
@@ -1477,7 +1486,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
         if not isinstance(urls, list):
             return []
-        return self._normalize_media_urls([str(url).strip() for url in urls if str(url).strip()], "video")
+        normalized = self._normalize_media_urls([str(url).strip() for url in urls if str(url).strip()], "video")
+        post_id = self._extract_post_id(submitted_post_url)
+        if post_id:
+            exact_matches = [url for url in normalized if post_id in url.lower()]
+            if exact_matches:
+                return exact_matches
+        return normalized
 
     async def _wait_for_video_ready(
         self,
