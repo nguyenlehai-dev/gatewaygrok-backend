@@ -1543,14 +1543,51 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 html.includes(".mp4") ||
                 html.includes("generated_video") ||
                 html.includes("share-videos/");
+              const visible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width > 0 &&
+                  rect.height > 0 &&
+                  rect.bottom > 0 &&
+                  rect.right > 0 &&
+                  rect.top < window.innerHeight &&
+                  rect.left < window.innerWidth &&
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  Number(style.opacity || "1") > 0.05
+                );
+              };
+              const percentCandidates = [];
+              const pushPercent = (value, allowCompact = false) => {
+                if (typeof value !== "string" || !value.trim()) return;
+                const direct = value.match(/Generating\s*([0-9]{1,3})\s*%/i);
+                const compact = allowCompact ? value.match(/(?:^|\s)([0-9]{1,3})\s*%(?:\s|$)/) : null;
+                const match = direct || compact;
+                if (!match) return;
+                const parsed = Number(match[1]);
+                if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) {
+                  percentCandidates.push(parsed);
+                }
+              };
+              pushPercent(body);
+              for (const node of Array.from(document.querySelectorAll("button, [role='button'], [role='status'], [aria-live], div, span"))) {
+                if (!visible(node)) continue;
+                const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+                if (!text || text.length > 80) continue;
+                if (text.includes("%") || /generating/i.test(text)) {
+                  pushPercent(text, true);
+                }
+              }
+              const progress = percentCandidates.length ? Math.max(...percentCandidates) : null;
               const generating =
                 normalized.includes("cancel video") ||
                 normalized.includes("generating") ||
-                /generating\s+\d{1,3}%/i.test(body);
-              const percentMatch = body.match(/Generating\s+(\d{1,3})%/i);
+                progress !== null;
               return {
                 generating,
-                progress: percentMatch ? percentMatch[1] : null,
+                progress,
                 hasDownload,
                 hasVideo,
                 htmlHasVideoUrl,
@@ -1705,22 +1742,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if state.get("hasVideo") or state.get("htmlHasVideoUrl"):
                     self._log_job_step(job, "video_ready_download_visible")
                     return []
-                if state.get("hasDownload"):
-                    download_without_video_hits += 1
-                    self._log_job_step(job, "video_download_visible_without_video")
-                    self._update_job_runtime_payload(
-                        job,
-                        message="Grok returned an image result first. Preparing video conversion...",
-                        stage="image-result",
-                    )
-                    if download_without_video_hits >= 4:
-                        self._log_job_step(job, "video_image_result_detected")
-                        return []
-                else:
-                    download_without_video_hits = 0
                 if state.get("generating"):
-                    progress = state.get("progress") or "unknown"
-                    self._log_job_step(job, f"video_generation_in_progress progress={progress}")
+                    progress = state.get("progress")
+                    self._log_job_step(job, f"video_generation_in_progress progress={progress or 'unknown'}")
                     if str(progress).isdigit():
                         self._update_job_runtime_payload(
                             job,
@@ -1728,6 +1752,20 @@ class GrokAutomationProvider(BaseAutomationProvider):
                             message=f"Generating {progress}%",
                             stage="generating",
                         )
+                if state.get("hasDownload"):
+                    download_without_video_hits += 1
+                    self._log_job_step(job, "video_download_visible_without_video")
+                    if not state.get("generating"):
+                        self._update_job_runtime_payload(
+                            job,
+                            message="Grok returned an image result first. Preparing video conversion...",
+                            stage="image-result",
+                        )
+                    if download_without_video_hits >= 4:
+                        self._log_job_step(job, "video_image_result_detected")
+                        return []
+                else:
+                    download_without_video_hits = 0
 
             await page.wait_for_timeout(poll_ms)
             elapsed += poll_ms
