@@ -770,10 +770,39 @@ class GrokAutomationProvider(BaseAutomationProvider):
                   const rect = svg.getBoundingClientRect();
                   return rect.width >= 36 && rect.height >= 36 && rect.width <= 140 && rect.height <= 140;
                 });
+              const hiddenMediaPanel = Array.from(document.querySelectorAll("svg"))
+                .some((svg) => {
+                  const iconRect = svg.getBoundingClientRect();
+                  if (iconRect.width < 36 || iconRect.height < 36 || iconRect.width > 160 || iconRect.height > 160) {
+                    return false;
+                  }
+                  let current = svg.parentElement;
+                  while (current instanceof HTMLElement && current !== document.body) {
+                    const rect = current.getBoundingClientRect();
+                    const style = window.getComputedStyle(current);
+                    const bigEnough = rect.width >= 220 && rect.height >= 220;
+                    const onScreen =
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      rect.top < window.innerHeight &&
+                      rect.left < window.innerWidth;
+                    const visible =
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity || "1") > 0.05;
+                    const notFullPage = rect.width <= window.innerWidth * 0.9 && rect.height <= window.innerHeight * 0.9;
+                    if (bigEnough && onScreen && visible && notFullPage) {
+                      return true;
+                    }
+                    current = current.parentElement;
+                  }
+                  return false;
+                });
 
               return {
                 blurredLargeImage,
                 eyeSlashIcon,
+                hiddenMediaPanel,
                 bodyText,
               };
             }
@@ -801,6 +830,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if details.get("blurredLargeImage") and details.get("eyeSlashIcon"):
             return (
                 f"Grok blurred or hid the generated {target} result before video conversion. "
+                "This is likely a sensitive-content or policy restriction."
+            )
+
+        if details.get("hiddenMediaPanel"):
+            return (
+                f"Grok hid the generated {target} result behind a visibility gate. "
                 "This is likely a sensitive-content or policy restriction."
             )
 
@@ -2436,6 +2471,16 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         if localized_media_urls:
                             media_urls = localized_media_urls
                     if not media_urls:
+                        hidden_message = await self._detect_hidden_media_block(page, "video")
+                        if hidden_message:
+                            self._update_job_runtime_payload(
+                                job,
+                                blocked=True,
+                                notice=hidden_message,
+                                message=hidden_message,
+                                stage="hidden",
+                            )
+                            raise ContentPolicyBlockedError(hidden_message)
                         if video_mode == "image_to_video":
                             raise InvalidVideoOutputError(
                                 "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
