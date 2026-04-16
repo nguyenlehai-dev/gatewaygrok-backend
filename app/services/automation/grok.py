@@ -36,6 +36,101 @@ class GrokAutomationProvider(BaseAutomationProvider):
             flush=True,
         )
 
+    def _coerce_image_to_video_prompt(self, prompt: str) -> str:
+        normalized = " ".join((prompt or "").split()).strip()
+        if not normalized:
+            return (
+                "Create a short cinematic video from the attached reference image. "
+                "Preserve the face and identity exactly, and animate the scene naturally."
+            )
+
+        lowered = normalized.lower()
+        video_markers = [
+            "video",
+            "animate",
+            "animation",
+            "camera movement",
+            "motion",
+            "cinematic shot",
+            "clip",
+        ]
+        if any(marker in lowered for marker in video_markers):
+            return normalized
+
+        return (
+            "Create a short cinematic video from the attached reference image. "
+            "Keep the face and identity exactly the same as the reference image. "
+            "Animate the subject naturally with subtle motion and realistic camera movement. "
+            f"Follow these appearance and scene details: {normalized}"
+        )
+
+    async def _ensure_video_generation_state(self, page: Page, prompt: str) -> None:
+        expected = prompt.strip().lower()[:80]
+        for _ in range(3):
+            state = await page.evaluate(
+                r"""
+                (expected) => {
+                  const visible = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                      rect.width > 0 &&
+                      rect.height > 0 &&
+                      rect.bottom > 0 &&
+                      rect.right > 0 &&
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity || "1") > 0.05
+                    );
+                  };
+                  const fields = Array.from(
+                    document.querySelectorAll("[contenteditable='true'], [role='textbox'], textarea, input")
+                  ).filter(visible);
+                  const field = fields
+                    .sort((left, right) => right.getBoundingClientRect().bottom - left.getBoundingClientRect().bottom)[0];
+                  const fieldText = field instanceof HTMLTextAreaElement || field instanceof HTMLInputElement
+                    ? field.value || ""
+                    : field?.innerText || "";
+                  const placeholder = [
+                    field?.getAttribute("data-placeholder") || "",
+                    field?.getAttribute("placeholder") || "",
+                    field?.getAttribute("aria-label") || "",
+                  ].join(" ").toLowerCase();
+                  const videoRadio = Array.from(document.querySelectorAll("button[role='radio']"))
+                    .find((button) => (button.innerText || "").trim().toLowerCase() === "video");
+                  const videoChecked = videoRadio?.getAttribute("aria-checked") === "true";
+                  const promptPresent = !expected || fieldText.trim().toLowerCase().includes(expected);
+                  return {
+                    videoChecked,
+                    placeholder,
+                    promptPresent,
+                    editMode: placeholder.includes("edit image") || placeholder.includes("describe your edit"),
+                  };
+                }
+                """,
+                expected,
+            )
+            if (
+                isinstance(state, dict)
+                and state.get("videoChecked")
+                and not state.get("editMode")
+                and state.get("promptPresent")
+            ):
+                return
+            with suppress(Exception):
+                await self._click_composer_video_mode(page)
+            with suppress(Exception):
+                video_mode_button = page.locator("[aria-label='Generation mode'] button[role='radio']:has-text('Video')").first
+                if await video_mode_button.count() > 0:
+                    await video_mode_button.click(timeout=2000)
+                    await page.wait_for_timeout(500)
+            await self._fill_grok_prompt(page, prompt, edit_mode=False)
+            await page.wait_for_timeout(600)
+        raise SubmitButtonDisabledError(
+            "Grok stayed in image-edit mode instead of video mode for this image-to-video job."
+        )
+
     async def _extract_image_candidates(self, page: Page) -> list[dict]:
         return await page.evaluate(
             r"""
@@ -1028,6 +1123,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             with suppress(Exception):
                 await self._click_composer_video_mode(page)
             await self._fill_grok_prompt(page, prompt, edit_mode=False)
+            await self._ensure_video_generation_state(page, prompt)
 
         try:
             submit = await self._find_submit_button(page)
@@ -1246,12 +1342,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
+            prompt_text = self._coerce_image_to_video_prompt(job.prompt) if video_mode == "image_to_video" else job.prompt
             if video_mode in {"text_to_video", "image_to_video"}:
                 self._log_job_step(job, f"video_flow_open_start mode={video_mode}")
                 option_state = await asyncio.wait_for(
                     self._open_imagine_video_flow(
                         page,
-                        job.prompt,
+                        prompt_text,
                         source_asset_path if video_mode == "image_to_video" else None,
                         video_mode,
                         ratio=str(ratio) if ratio else None,
