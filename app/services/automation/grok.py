@@ -1005,6 +1005,68 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await page.wait_for_timeout(delay_ms)
         return best_complete or latest
 
+    async def _video_generation_state(self, page: Page) -> dict:
+        return await page.evaluate(
+            r"""
+            () => {
+              const body = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+              const normalized = body.toLowerCase();
+              const hasDownload = Boolean(
+                document.querySelector("button[aria-label='Download'], button:has-text('Download')")
+              );
+              const hasVideo = Array.from(document.querySelectorAll("video")).some((video) => {
+                const src = video.currentSrc || video.src || "";
+                return Boolean(src);
+              });
+              const generating =
+                normalized.includes("cancel video") ||
+                normalized.includes("generating") ||
+                /generating\s+\d{1,3}%/i.test(body);
+              const percentMatch = body.match(/Generating\s+(\d{1,3})%/i);
+              return {
+                generating,
+                progress: percentMatch ? percentMatch[1] : null,
+                hasDownload,
+                hasVideo,
+                body: body.slice(0, 1000),
+              };
+            }
+            """
+        )
+
+    async def _wait_for_video_ready(
+        self,
+        page: Page,
+        job: AutomationJob,
+        *,
+        timeout_ms: int = 480000,
+        poll_ms: int = 4000,
+    ) -> list[str]:
+        elapsed = 0
+        while elapsed < timeout_ms:
+            blocked_message = await self._detect_content_policy_block(page, "video")
+            if blocked_message:
+                raise ContentPolicyBlockedError(blocked_message)
+
+            media_urls = self._normalize_media_urls(await super()._extract_media_urls(page, "video"), "video")
+            if media_urls:
+                self._log_job_step(job, f"video_ready_media_detected media_count={len(media_urls)}")
+                return media_urls
+
+            state = await self._video_generation_state(page)
+            if isinstance(state, dict):
+                if state.get("hasDownload"):
+                    self._log_job_step(job, "video_ready_download_visible")
+                    return []
+                if state.get("generating"):
+                    progress = state.get("progress") or "unknown"
+                    self._log_job_step(job, f"video_generation_in_progress progress={progress}")
+
+            await page.wait_for_timeout(poll_ms)
+            elapsed += poll_ms
+        self._log_job_step(job, "video_ready_timeout")
+        return []
+
     async def _download_remote_media(self, page: Page, url: str, target_path: Path) -> str:
         payload = await page.evaluate(
             """
@@ -1310,6 +1372,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         await page.wait_for_timeout(1500)
 
         self._log_job_step(job, "image_result_to_video_submitted")
+        media_urls = await self._wait_for_video_ready(page, job, timeout_ms=480000)
+        if media_urls:
+            return media_urls
         media_urls = await asyncio.wait_for(
             self._download_file(page, profile, job, "video"),
             timeout=180,
@@ -1408,6 +1473,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 )
                 self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
                 media_urls: list[str] = []
+                media_urls = await self._wait_for_video_ready(
+                    page,
+                    job,
+                    timeout_ms=480000 if video_mode == "image_to_video" else 300000,
+                )
                 if not media_urls:
                     self._log_job_step(job, "direct_video_download_start")
                     try:
