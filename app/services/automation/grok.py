@@ -1689,15 +1689,24 @@ class GrokAutomationProvider(BaseAutomationProvider):
             raise ContentPolicyBlockedError(blocked_message)
         return option_state
 
-    async def _download_file(self, page: Page, profile: Profile, job: AutomationJob, suffix_label: str) -> list[str]:
+    async def _download_file(
+        self,
+        page: Page,
+        profile: Profile,
+        job: AutomationJob,
+        suffix_label: str,
+        *,
+        attempts: int = 24,
+        delay_ms: int = 5000,
+    ) -> list[str]:
         download_button = await self._wait_for_action_button(
             page,
             [
                 "button[aria-label='Download']",
                 "button:has-text('Download')",
             ],
-            attempts=24,
-            delay_ms=5000,
+            attempts=attempts,
+            delay_ms=delay_ms,
             policy_target=suffix_label,
         )
 
@@ -1894,6 +1903,25 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                     )
+                    state = await self._video_generation_state(page)
+                    if isinstance(state, dict) and (state.get("hasDownload") or state.get("hasVideo")):
+                        self._log_job_step(job, "direct_video_download_preferred")
+                        try:
+                            downloaded_media = await asyncio.wait_for(
+                                self._download_file(
+                                    page,
+                                    profile,
+                                    job,
+                                    "video",
+                                    attempts=6,
+                                    delay_ms=1500,
+                                ),
+                                timeout=90,
+                            )
+                        except asyncio.TimeoutError:
+                            downloaded_media = []
+                        if downloaded_media:
+                            media_urls = downloaded_media
                     network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
                         network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
