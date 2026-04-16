@@ -22,7 +22,11 @@ async def ensure_profile_session_ready(db: Session, profile: Profile) -> dict:
     launched_live_browser = False
 
     async def _analyze():
-        return await provider.analyze_session(profile, profile.proxy, automation_settings)
+        timeout_seconds = min(max(int(automation_settings.timeout_ms / 1000), settings.live_browser_start_timeout_seconds), 60)
+        return await asyncio.wait_for(
+            provider.analyze_session(profile, profile.proxy, automation_settings),
+            timeout=timeout_seconds,
+        )
 
     try:
         result = await _analyze()

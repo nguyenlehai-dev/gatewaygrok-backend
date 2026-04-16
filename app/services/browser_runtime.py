@@ -57,6 +57,34 @@ def _profile_browser_log_path(profile_id: str) -> Path:
     return RUNTIME_DIR / f"profile-browser-{profile_id}.log"
 
 
+def _profile_user_data_dir(profile_id: str) -> Path:
+    return ROOT_DIR / "storage" / "profiles" / profile_id / "user-data"
+
+
+def _remove_stale_chromium_locks(profile_id: str) -> None:
+    user_data_dir = _profile_user_data_dir(profile_id)
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (user_data_dir / lock_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _pid_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _pid_belongs_to_profile_browser(pid: int, profile_id: str) -> bool:
+    cmdline = _pid_cmdline(pid)
+    if not cmdline:
+        return False
+    user_data_arg = f"--user-data-dir={_profile_user_data_dir(profile_id)}"
+    return profile_id in cmdline or user_data_arg in cmdline or "profile_login_bootstrap.py" in cmdline
+
+
 def warm_browser_reuse_enabled() -> bool:
     value = os.getenv("GATEWAY_WARM_BROWSER_REUSE_FOR_JOBS", "true").strip().lower()
     return value not in {"0", "false", "no", "off"}
@@ -114,10 +142,16 @@ def launch_profile_browser(profile_id: str) -> bool:
         if existing_pid:
             try:
                 os.kill(existing_pid, 0)
-                return False
+                if _pid_belongs_to_profile_browser(existing_pid, profile_id):
+                    try:
+                        os.kill(existing_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                pid_path.unlink(missing_ok=True)
             except OSError:
                 pid_path.unlink(missing_ok=True)
 
+    _remove_stale_chromium_locks(profile_id)
     script_path = ROOT_DIR / "scripts" / "profile_login_bootstrap.py"
     log_path = _profile_browser_log_path(profile_id)
     with log_path.open("a", encoding="utf-8") as handle:
