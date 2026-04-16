@@ -1805,102 +1805,103 @@ class GrokAutomationProvider(BaseAutomationProvider):
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             prompt_text = self._coerce_image_to_video_prompt(job.prompt) if video_mode == "image_to_video" else job.prompt
             if video_mode in {"text_to_video", "image_to_video"}:
-                self._log_job_step(job, f"video_flow_open_start mode={video_mode}")
-                option_state = await asyncio.wait_for(
-                    self._open_imagine_video_flow(
+                try:
+                    self._log_job_step(job, f"video_flow_open_start mode={video_mode}")
+                    option_state = await asyncio.wait_for(
+                        self._open_imagine_video_flow(
+                            page,
+                            prompt_text,
+                            source_asset_path if video_mode == "image_to_video" else None,
+                            video_mode,
+                            ratio=str(ratio) if ratio else None,
+                            quality=str(quality) if quality else None,
+                            duration=duration,
+                        ),
+                        timeout=180 if video_mode == "image_to_video" else 150,
+                    )
+                    self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
+                    submitted_post_url = option_state.get("submitted_post_url") if isinstance(option_state, dict) else None
+                    baseline_video_urls = option_state.get("baseline_video_urls") if isinstance(option_state, dict) else None
+                    if isinstance(submitted_post_url, str) and submitted_post_url:
+                        with suppress(Exception):
+                            await page.goto(submitted_post_url, wait_until="domcontentloaded")
+                            await page.wait_for_timeout(1200)
+                    media_urls: list[str] = []
+                    media_urls = await self._wait_for_video_ready(
                         page,
-                        prompt_text,
-                        source_asset_path if video_mode == "image_to_video" else None,
-                        video_mode,
-                        ratio=str(ratio) if ratio else None,
-                        quality=str(quality) if quality else None,
-                        duration=duration,
-                    ),
-                    timeout=180 if video_mode == "image_to_video" else 150,
-                )
-                self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
-                submitted_post_url = option_state.get("submitted_post_url") if isinstance(option_state, dict) else None
-                baseline_video_urls = option_state.get("baseline_video_urls") if isinstance(option_state, dict) else None
-                if isinstance(submitted_post_url, str) and submitted_post_url:
-                    with suppress(Exception):
-                        await page.goto(submitted_post_url, wait_until="domcontentloaded")
-                        await page.wait_for_timeout(1200)
-                media_urls: list[str] = []
-                media_urls = await self._wait_for_video_ready(
-                    page,
-                    job,
-                    timeout_ms=480000 if video_mode == "image_to_video" else 300000,
-                    baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
-                )
-                network_video_urls = self._read_video_network_capture(page)
-                if isinstance(baseline_video_urls, list):
-                    network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
-                if network_video_urls:
-                    media_urls = network_video_urls
-                if not media_urls:
-                    media_urls = await self._extract_ready_video_urls(page)
+                        job,
+                        timeout_ms=480000 if video_mode == "image_to_video" else 300000,
+                        baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
+                    )
+                    network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
-                        media_urls = self._filter_new_media_urls(media_urls, baseline_video_urls)
-                if not media_urls:
-                    self._log_job_step(job, "direct_video_download_start")
-                    try:
+                        network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
+                    if network_video_urls:
+                        media_urls = network_video_urls
+                    if not media_urls:
+                        media_urls = await self._extract_ready_video_urls(page)
+                        if isinstance(baseline_video_urls, list):
+                            media_urls = self._filter_new_media_urls(media_urls, baseline_video_urls)
+                    if not media_urls:
+                        self._log_job_step(job, "direct_video_download_start")
+                        try:
+                            media_urls = await asyncio.wait_for(
+                                self._download_file(page, profile, job, "video"),
+                                timeout=180,
+                            )
+                        except asyncio.TimeoutError:
+                            self._log_job_step(job, "direct_video_download_timeout")
+                            media_urls = []
+                    if not media_urls:
+                        self._log_job_step(job, "wait_video_media_start")
                         media_urls = await asyncio.wait_for(
-                            self._download_file(page, profile, job, "video"),
-                            timeout=180,
+                            self._wait_for_media(page, "video"),
+                            timeout=150,
                         )
-                    except asyncio.TimeoutError:
-                        self._log_job_step(job, "direct_video_download_timeout")
-                        media_urls = []
-                if not media_urls:
-                    self._log_job_step(job, "wait_video_media_start")
-                    media_urls = await asyncio.wait_for(
-                        self._wait_for_media(page, "video"),
-                        timeout=150,
-                    )
-                if not media_urls and video_mode == "image_to_video":
-                    self._log_job_step(job, "image_result_to_video_fallback_start")
-                    try:
-                        media_urls = await self._promote_image_result_to_video(page, profile, job, prompt_text)
-                    except asyncio.TimeoutError:
-                        self._log_job_step(job, "image_result_to_video_fallback_timeout")
-                        media_urls = []
-                    if media_urls:
-                        output_dir = profile_storage.output_dir(profile.id)
-                        localized: list[str] = []
-                        for index, url in enumerate(media_urls, start=1):
-                            if not str(url).startswith(("http://", "https://", "data:")):
-                                localized.append(str(url))
-                                continue
-                            target_path = output_dir / f"{job.id}-video-{index}.mp4"
-                            if url.startswith("data:"):
-                                localized.append(await self._save_data_url(url, target_path))
-                            else:
-                                localized.append(await self._download_remote_media(page, url, target_path))
-                        media_urls = localized
-                media_urls = self._normalize_media_urls(media_urls, "video")
-                if not media_urls:
-                    if video_mode == "image_to_video":
+                    if not media_urls and video_mode == "image_to_video":
+                        self._log_job_step(job, "image_result_to_video_fallback_start")
+                        try:
+                            media_urls = await self._promote_image_result_to_video(page, profile, job, prompt_text)
+                        except asyncio.TimeoutError:
+                            self._log_job_step(job, "image_result_to_video_fallback_timeout")
+                            media_urls = []
+                        if media_urls:
+                            output_dir = profile_storage.output_dir(profile.id)
+                            localized: list[str] = []
+                            for index, url in enumerate(media_urls, start=1):
+                                if not str(url).startswith(("http://", "https://", "data:")):
+                                    localized.append(str(url))
+                                    continue
+                                target_path = output_dir / f"{job.id}-video-{index}.mp4"
+                                if url.startswith("data:"):
+                                    localized.append(await self._save_data_url(url, target_path))
+                                else:
+                                    localized.append(await self._download_remote_media(page, url, target_path))
+                            media_urls = localized
+                    media_urls = self._normalize_media_urls(media_urls, "video")
+                    if not media_urls:
+                        if video_mode == "image_to_video":
+                            raise InvalidVideoOutputError(
+                                "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
+                            )
                         raise InvalidVideoOutputError(
-                            "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
+                            "Grok did not return a real video file for this video job."
                         )
-                    raise InvalidVideoOutputError(
-                        "Grok did not return a real video file for this video job."
-                    )
-                return {
-                    "target": job.target.value,
-                    "video_mode": video_mode,
-                    "source_asset_path": source_asset_path,
-                    "ratio": ratio,
-                    "quality": quality,
-                    "duration": duration,
-                    "requested_options": option_state.get("requested", {}),
-                    "applied_options": option_state.get("applied", {}),
-                    "unapplied_options": option_state.get("unapplied", {}),
-                    "media_urls": media_urls,
-                    "submitted_post_url": submitted_post_url,
-                }
-            finally:
-                self._stop_video_network_capture(page)
+                    return {
+                        "target": job.target.value,
+                        "video_mode": video_mode,
+                        "source_asset_path": source_asset_path,
+                        "ratio": ratio,
+                        "quality": quality,
+                        "duration": duration,
+                        "requested_options": option_state.get("requested", {}),
+                        "applied_options": option_state.get("applied", {}),
+                        "unapplied_options": option_state.get("unapplied", {}),
+                        "media_urls": media_urls,
+                        "submitted_post_url": submitted_post_url,
+                    }
+                finally:
+                    self._stop_video_network_capture(page)
 
         option_state = await self._open_imagine_image_flow(
             page,
