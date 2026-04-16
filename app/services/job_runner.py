@@ -1,4 +1,8 @@
+import traceback
 import asyncio
+import logging
+import time
+from pathlib import Path
 
 from sqlalchemy.orm import joinedload
 
@@ -8,6 +12,43 @@ from app.models.profile import Profile
 from app.schemas.setting import AutomationSettings
 from app.services.automation.registry import providers
 from app.services.settings_service import settings_service
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def _emit_runtime_log(message: str) -> None:
+    print(message, flush=True)
+    logger.info(message)
+    try:
+        runtime_dir = Path("/app/storage/runtime")
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        with (runtime_dir / "browser-jobs.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        logger.exception("job_runtime_log_write_failed")
+
+
+def _friendly_job_error(exc: Exception) -> str | None:
+    error_name = type(exc).__name__
+    message = str(exc).strip()
+    lowered = message.lower()
+
+    if error_name in {"ContentPolicyBlockedError", "SubmitButtonDisabledError", "InvalidVideoOutputError"}:
+        return message
+
+    if "no matching selector found" in lowered and "make video" in lowered:
+        return (
+            "Grok did not show the 'Make video' action for this image-to-video job. "
+            "The generated image stayed in a hidden/blocked state, so the video step could not continue."
+        )
+
+    if "target page, context or browser has been closed" in lowered:
+        return (
+            "The Grok browser session closed unexpectedly while preparing this job. "
+            "Please retry after the profile session is stable."
+        )
+
+    return None
 
 
 class JobRunner:
@@ -105,28 +146,49 @@ class JobRunner:
                 db.commit()
                 return
 
+            job.status = JobStatus.RUNNING
+            db.commit()
+
             async with semaphore:
-                job.status = JobStatus.RUNNING
-                db.commit()
+                started_at = time.perf_counter()
+                _emit_runtime_log(
+                    "job_started "
+                    f"job_id={job.id} profile_id={profile.id} provider={profile.category.value} "
+                    f"target={job.target.value} queue_size={self.queue.qsize()} "
+                    f"profile_limit={self.profile_limits.get(profile.id, max(profile.concurrency_limit, 1))}"
+                )
                 try:
-                    timeout_seconds = max(120, int(automation_settings.timeout_ms / 1000) * 2)
-                    if job.target.value == "video":
-                        timeout_seconds = max(timeout_seconds, 600)
-                    result = await asyncio.wait_for(
-                        provider.run(profile, profile.proxy, job, automation_settings),
-                        timeout=timeout_seconds,
-                    )
+                    result = await provider.run(profile, profile.proxy, job, automation_settings)
                     if job.target.value in {"image", "video"} and not result.get("media_urls"):
                         raise RuntimeError(f"No media output captured for {job.target.value} job")
                     job.status = JobStatus.SUCCEEDED
                     job.result_payload = result
                     job.error_message = None
-                except TimeoutError:
-                    job.status = JobStatus.FAILED
-                    job.error_message = f"Automation timed out after {timeout_seconds}s"
+                    _emit_runtime_log(
+                        "job_succeeded "
+                        f"job_id={job.id} profile_id={profile.id} provider={profile.category.value} "
+                        f"target={job.target.value} duration_ms={int((time.perf_counter() - started_at) * 1000)}"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     job.status = JobStatus.FAILED
-                    job.error_message = str(exc) or exc.__class__.__name__
+                    friendly_message = _friendly_job_error(exc)
+                    if friendly_message:
+                        job.error_message = friendly_message
+                    else:
+                        job.error_message = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+                    _emit_runtime_log(
+                        "job_failed "
+                        f"job_id={job.id} profile_id={profile.id} provider={profile.category.value} "
+                        f"target={job.target.value} duration_ms={int((time.perf_counter() - started_at) * 1000)}"
+                    )
+                    logger.exception(
+                        "job_failed job_id=%s profile_id=%s provider=%s target=%s duration_ms=%s",
+                        job.id,
+                        profile.id,
+                        profile.category.value,
+                        job.target.value,
+                        int((time.perf_counter() - started_at) * 1000),
+                    )
                 db.add(job)
                 db.commit()
 

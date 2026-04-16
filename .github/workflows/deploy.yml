@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd /home/vpsroot/apps/gatewaygrok-prod/be
+          cd /home/vpsroot/apps/gatewaygrok-staging/be
           git fetch origin
           git checkout prod
           git reset --hard origin/prod

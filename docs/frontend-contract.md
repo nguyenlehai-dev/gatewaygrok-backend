@@ -153,7 +153,7 @@ Header: `x-api-key: <plain_key>`
   "target": "video",
   "result_payload": {
     "media_urls": [
-      "https://flowgrok.plxeditor.com/storage/profiles/uuid/output/42d72140-8613-4a53-a1df-1af4db95f4df-video-1.mp4"
+      "https://testflowgrok.plxeditor.com/storage/profiles/uuid/output/42d72140-8613-4a53-a1df-1af4db95f4df-video-1.mp4"
     ]
   },
   "error_message": null

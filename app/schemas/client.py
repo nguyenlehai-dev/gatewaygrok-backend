@@ -9,8 +9,8 @@ class ClientJobCreate(BaseModel):
     prompt: str
     negative_prompt: str | None = None
     count: int = 1
+    provider_payload: dict | None = None
     reference_images: list[str] | None = None
     ratio: str | None = None
     quality: str | None = None
-    duration: int | str | None = None
-    provider_payload: dict | None = None
+    duration: int | None = None

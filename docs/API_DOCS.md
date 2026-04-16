@@ -20,13 +20,11 @@ Authorization: Bearer <admin_token>
 
 1. Admin tao profile Grok.
 2. Admin login/import cookie cho profile.
-3. Neu session da mat, admin goi `POST /api/profiles/{profile_id}/launch-login` de bootstrap login lai.
-4. Sau khi login xong, admin goi `POST /api/profiles/{profile_id}/launch-runtime` de giu browser song theo huong no-VNC.
-5. Admin goi `POST /api/profiles/{profile_id}/session-check` de xac nhan profile san sang.
-6. Neu can image-to-video, admin upload anh qua `POST /api/profiles/{profile_id}/assets` hoac client gui URL anh (backend se auto-download).
-7. Admin tao client key qua `POST /api/api-keys`.
-8. Client goi `POST /api/client/generate` (profile_id la optional).
-9. Client poll `GET /api/client/tasks/{task_id}/status` de lay payload nhe, hoac `/tasks/{task_id}` neu can day du.
+3. Admin goi `POST /api/profiles/{profile_id}/session-check` de xac nhan profile san sang.
+4. Neu can image-to-video, admin upload anh qua `POST /api/profiles/{profile_id}/assets` hoac client gui URL anh (backend se auto-download).
+5. Admin tao client key qua `POST /api/api-keys`.
+6. Client goi `POST /api/client/generate` (profile_id la optional).
+7. Client poll `GET /api/client/tasks/{task_id}/status` de lay payload nhe, hoac `/tasks/{task_id}` neu can day du.
 
 ## Generate task
 
@@ -104,7 +102,7 @@ Success example:
   "target": "image",
   "result_payload": {
     "media_urls": [
-      "https://flowgrok.plxeditor.com/storage/profiles/PROFILE_ID/output/42d72140-8613-4a53-a1df-1af4db95f4df-image-1.jpg"
+      "https://testflowgrok.plxeditor.com/storage/profiles/PROFILE_ID/output/42d72140-8613-4a53-a1df-1af4db95f4df-image-1.jpg"
     ]
   },
   "error_message": null
@@ -207,50 +205,6 @@ Launch live browser for login:
 ```http
 POST /api/profiles/{profile_id}/launch-login
 ```
-
-Launch no-VNC runtime browser:
-
-```http
-POST /api/profiles/{profile_id}/launch-runtime
-Authorization: Bearer <admin_token>
-Content-Type: application/json
-```
-
-```json
-{
-  "display": ":101",
-  "start_url": "https://grok.com/"
-}
-```
-
-Runtime status:
-
-```http
-GET /api/profiles/{profile_id}/runtime-status
-Authorization: Bearer <admin_token>
-```
-
-Stop no-VNC runtime browser:
-
-```http
-POST /api/profiles/{profile_id}/stop-runtime
-Authorization: Bearer <admin_token>
-Content-Type: application/json
-```
-
-```json
-{
-  "display": ":101"
-}
-```
-
-Recommended admin flow:
-
-1. `launch-login` only when session is lost and manual login is needed.
-2. `launch-runtime` after login to keep the browser alive without VNC.
-3. `session-check` should return `authenticated`.
-4. Submit client/admin jobs while runtime browser is still alive.
-5. Use `runtime-status` to confirm CDP/debug port is open before blaming job failures on session state.
 
 ## Mapping rules
 

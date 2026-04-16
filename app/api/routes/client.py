@@ -1,21 +1,21 @@
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 import mimetypes
 from pathlib import Path
+import time
 from urllib.parse import urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
-
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import desc
 from sqlalchemy.orm import Session
+from sqlalchemy import desc, func
 
 from app.api.deps import db_session, require_api_key
-from app.core.config import settings
 from app.models.api_key import ApiKey
-from app.models.automation_job import AutomationJob, JobTarget
+from app.models.automation_job import AutomationJob, JobStatus, JobTarget
 from app.models.profile import Profile
 from app.schemas.client import ClientJobCreate
 from app.schemas.job import JobRead
 from app.services.api_key_service import api_key_service
+from app.services.browser_runtime import is_debug_port_open
 from app.services.job_runner import job_runner
 from app.services.session_guard import ensure_profile_session_ready
 from app.services.profile_storage import profile_storage
@@ -23,57 +23,24 @@ from app.services.profile_storage import profile_storage
 router = APIRouter()
 
 MAX_REFERENCE_IMAGE_BYTES = 15 * 1024 * 1024
-INTERNAL_STORAGE_HOSTS = {
-    "flowgrok.plxeditor.com",
-    "www.flowgrok.plxeditor.com",
-    "testflowgrok.plxeditor.com",
-}
+PROFILE_SELECTION_FAILURE_COOLDOWN_SECONDS = 120
+PROFILE_FAILURE_COOLDOWNS: dict[str, float] = {}
 
 
 def _is_remote_url(value: str) -> bool:
     return value.startswith(("http://", "https://"))
 
 
-def _resolve_internal_storage_url(url: str) -> str | None:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in INTERNAL_STORAGE_HOSTS:
-        return None
-    if not parsed.path.startswith("/storage/"):
-        return None
-
-    storage_root = settings.storage_root.resolve()
-    relative_path = parsed.path.removeprefix("/storage/")
-    candidate = (storage_root / relative_path).resolve()
-    if not candidate.is_file():
-        return None
-    if not candidate.is_relative_to(storage_root):
-        return None
-    return str(candidate)
-
-
 def _download_reference_image(url: str, profile_id: str) -> str:
-    internal_storage_path = _resolve_internal_storage_url(url)
-    if internal_storage_path:
-        return internal_storage_path
-
     try:
         request = UrlRequest(url, headers={"User-Agent": "GatewayGrok/1.0"})
-        with urlopen(request, timeout=30) as response:  # noqa: S310
+        with urlopen(request, timeout=15) as response:  # noqa: S310
             content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
             if not content_type.startswith("image/"):
                 raise HTTPException(status_code=400, detail="reference_images must be image URLs")
-            chunks: list[bytes] = []
-            total_size = 0
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_REFERENCE_IMAGE_BYTES:
-                    raise HTTPException(status_code=413, detail="reference_images file too large")
-                chunks.append(chunk)
-            data = b"".join(chunks)
+            data = response.read(MAX_REFERENCE_IMAGE_BYTES + 1)
+            if len(data) > MAX_REFERENCE_IMAGE_BYTES:
+                raise HTTPException(status_code=413, detail="reference_images file too large")
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -85,37 +52,11 @@ def _download_reference_image(url: str, profile_id: str) -> str:
     return str(asset_path)
 
 def _absolute_url(request: Request, value: str) -> str:
-    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
-
-    def _with_public_scheme(url: str) -> str:
-        if forwarded_proto in {"http", "https"}:
-            return url.replace(f"{request.url.scheme}://", f"{forwarded_proto}://", 1)
-        return url
-
     if not value:
         return value
     if value.startswith(("http://", "https://", "data:")):
         return value
-
-    storage_root = settings.storage_root.resolve()
-    normalized = value.replace("\\", "/")
-    try:
-        candidate = Path(normalized)
-        candidate = (Path.cwd() / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-        if candidate.is_relative_to(storage_root):
-            relative = candidate.relative_to(storage_root).as_posix()
-            return _with_public_scheme(str(request.url_for("storage", path=relative)))
-    except Exception:  # noqa: BLE001
-        pass
-
-    storage_prefix = f"{settings.storage_root.as_posix().rstrip('/')}/"
-    if normalized.startswith(storage_prefix):
-        relative = normalized.removeprefix(storage_prefix).lstrip("/")
-        return _with_public_scheme(str(request.url_for("storage", path=relative)))
-
     base = str(request.base_url).rstrip("/")
-    if forwarded_proto in {"http", "https"}:
-        base = base.replace(f"{request.url.scheme}://", f"{forwarded_proto}://", 1)
     if value.startswith("/"):
         return f"{base}{value}"
     return f"{base}/{value.lstrip('/')}"
@@ -146,39 +87,86 @@ def _lite_payload(job: AutomationJob, request: Request) -> dict:
             if isinstance(item, str) and item:
                 url = _absolute_url(request, item)
                 break
-    status = payload.get("status")
-    success = True if status == "succeeded" else False if status == "failed" else None
+    success = payload.get("status") == "succeeded"
     message = payload.get("error_message") or payload.get("status")
     return {
         "task_id": payload.get("id"),
-        "status": status,
+        "status": payload.get("status"),
         "success": success,
         "message": message,
         "url": url,
     }
+
+
+def _prune_profile_failure_cooldowns(now_ts: float) -> None:
+    expired = [profile_id for profile_id, until_ts in PROFILE_FAILURE_COOLDOWNS.items() if until_ts <= now_ts]
+    for profile_id in expired:
+        PROFILE_FAILURE_COOLDOWNS.pop(profile_id, None)
+
+
+def _profile_selection_sort_key(profile: Profile, profile_loads: dict[str, int]) -> tuple[int, int, int, str]:
+    load = profile_loads.get(profile.id, 0)
+    limit = max(profile.concurrency_limit, 1)
+    warm_bonus = 0 if is_debug_port_open(profile.id) else 1
+    at_capacity_penalty = 1 if load >= limit else 0
+    return (
+        at_capacity_penalty,
+        warm_bonus,
+        load,
+        profile.id,
+    )
 
 async def _select_profile_from_pool(
     db: Session,
     *,
     allowed_categories: set[str] | None,
 ) -> Profile:
+    now_ts = time.time()
+    _prune_profile_failure_cooldowns(now_ts)
     query = db.query(Profile).filter(Profile.is_active.is_(True))
     if allowed_categories:
         query = query.filter(Profile.category.in_(sorted(allowed_categories)))
     profiles = query.order_by(desc(Profile.updated_at)).all()
 
+    profile_ids = [profile.id for profile in profiles]
+    load_rows = []
+    if profile_ids:
+        load_rows = (
+            db.query(AutomationJob.profile_id, func.count(AutomationJob.id))
+            .filter(AutomationJob.profile_id.in_(profile_ids))
+            .filter(AutomationJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]))
+            .group_by(AutomationJob.profile_id)
+            .all()
+        )
+    profile_loads = {profile_id: count for profile_id, count in load_rows}
+
+    cooled_profiles = [profile for profile in profiles if PROFILE_FAILURE_COOLDOWNS.get(profile.id, 0) > now_ts]
+    available_profiles = [profile for profile in profiles if PROFILE_FAILURE_COOLDOWNS.get(profile.id, 0) <= now_ts]
+    available_profiles = sorted(available_profiles, key=lambda profile: _profile_selection_sort_key(profile, profile_loads))
+    cooled_profiles = sorted(cooled_profiles, key=lambda profile: _profile_selection_sort_key(profile, profile_loads))
+    profiles = [*available_profiles, *cooled_profiles]
+
     last_error: HTTPException | None = None
     for profile in profiles:
         try:
             await ensure_profile_session_ready(db, profile)
+            PROFILE_FAILURE_COOLDOWNS.pop(profile.id, None)
             return profile
         except HTTPException as exc:  # noqa: PERF203
             last_error = exc
+            PROFILE_FAILURE_COOLDOWNS[profile.id] = time.time() + PROFILE_SELECTION_FAILURE_COOLDOWN_SECONDS
             continue
 
     detail = {
         "message": "No available profile in pool",
         "categories": sorted(allowed_categories) if allowed_categories else None,
+        "profile_loads": {profile.id: profile_loads.get(profile.id, 0) for profile in profiles},
+        "profile_warm": {profile.id: is_debug_port_open(profile.id) for profile in profiles},
+        "profile_cooldowns": {
+            profile.id: max(0, int(PROFILE_FAILURE_COOLDOWNS.get(profile.id, 0) - now_ts))
+            for profile in profiles
+            if PROFILE_FAILURE_COOLDOWNS.get(profile.id, 0) > now_ts
+        },
     }
     if last_error is not None:
         detail["last_error"] = last_error.detail
@@ -233,7 +221,7 @@ async def create_client_job(
     if payload.target == JobTarget.VIDEO:
         provider_payload.setdefault(
             "video_mode",
-            "image_to_video" if reference_images else "text_to_video",
+            "image_to_video" if (reference_images or provider_payload.get("source_asset_path")) else "text_to_video",
         )
 
     job_payload["profile_id"] = profile.id

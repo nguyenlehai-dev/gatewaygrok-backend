@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     browser_headless: bool = True
     default_concurrency: int = 2
     default_timeout_ms: int = 120000
+    reuse_live_browser_for_jobs: bool = False
+    live_browser_start_timeout_seconds: int = 20
     api_key_header: str = "x-api-key"
     admin_username: str = "admin"
     admin_password: str = "change-me"

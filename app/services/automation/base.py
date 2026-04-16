@@ -1,5 +1,8 @@
 import asyncio
 import json
+import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from pathlib import Path
@@ -7,16 +10,37 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
+from app.core.config import settings
 from app.models.automation_job import AutomationJob
 from app.models.profile import Profile
 from app.models.proxy import Proxy
 from app.schemas.setting import AutomationSettings
 from app.services.browser_runtime import (
+    cancel_scheduled_profile_browser_stop,
     debug_endpoint_for_profile,
     is_debug_port_open,
+    launch_profile_browser,
+    live_browser_idle_timeout_seconds,
+    schedule_profile_browser_stop,
     resolve_browser_executable,
+    wait_for_debug_port,
+    warm_browser_reuse_enabled,
 )
 from app.services.profile_storage import profile_storage
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def _emit_runtime_log(message: str) -> None:
+    print(message, flush=True)
+    logger.info(message)
+    try:
+        runtime_dir = Path("/app/storage/runtime")
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        with (runtime_dir / "browser-jobs.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        logger.exception("browser_runtime_log_write_failed")
 
 
 class BaseAutomationProvider(ABC):
@@ -61,27 +85,29 @@ class BaseAutomationProvider(ABC):
         prefer_live_browser: bool = False,
     ) -> tuple[BrowserContext, object, bool, Browser | None]:
         if prefer_live_browser:
-            live_endpoint = debug_endpoint_for_profile(profile.id)
-            last_live_exc: Exception | None = None
-            for _ in range(8):
-                if not is_debug_port_open(profile.id):
-                    await asyncio.sleep(1)
-                    continue
+            cancel_scheduled_profile_browser_stop(profile.id)
+            launched_live_browser = False
+            if not is_debug_port_open(profile.id):
+                launched_live_browser = launch_profile_browser(profile.id)
+                if launched_live_browser:
+                    _emit_runtime_log(
+                        "profile_browser_launch_requested "
+                        f"profile_id={profile.id} provider={self.provider_name}"
+                    )
+                wait_for_debug_port(profile.id, timeout_seconds=20.0)
+            if is_debug_port_open(profile.id):
                 try:
                     playwright = await async_playwright().start()
-                    browser = await playwright.chromium.connect_over_cdp(live_endpoint)
+                    browser = await playwright.chromium.connect_over_cdp(debug_endpoint_for_profile(profile.id))
                     context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                    _emit_runtime_log(
+                        "profile_browser_connected "
+                        f"profile_id={profile.id} provider={self.provider_name} launched={launched_live_browser}"
+                    )
                     return context, playwright, True, browser
-                except Exception as exc:  # noqa: BLE001
-                    last_live_exc = exc
+                except Exception:  # noqa: BLE001
                     with suppress(Exception):
                         await playwright.stop()
-                    await asyncio.sleep(1)
-            live_exc = last_live_exc or RuntimeError(
-                f"Live browser CDP is not available for profile {profile.id} at {live_endpoint}"
-            )
-            if not self._should_retry_without_live_browser(live_exc):
-                raise live_exc
 
         playwright = await async_playwright().start()
         antidetect = profile.antidetect or {}
@@ -91,6 +117,14 @@ class BaseAutomationProvider(ABC):
                 "width": antidetect["viewport_width"],
                 "height": antidetect["viewport_height"],
             }
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--enable-unsafe-swiftshader",
+            "--use-angle=swiftshader",
+        ]
         launch_kwargs = {
             "headless": automation_settings.headless,
             "proxy": self._proxy_options(proxy),
@@ -100,35 +134,29 @@ class BaseAutomationProvider(ABC):
             "user_agent": antidetect.get("user_agent"),
             "color_scheme": antidetect.get("color_scheme") or "dark",
             "ignore_default_args": ["--enable-automation"],
-            "args": ["--disable-blink-features=AutomationControlled"],
+            "args": launch_args,
         }
-        executable_path = resolve_browser_executable()
-        if executable_path:
-            launch_kwargs["executable_path"] = executable_path
+        if not automation_settings.headless:
+            launch_env = os.environ.copy()
+            launch_env["DISPLAY"] = launch_env.get("DISPLAY") or ":99"
+            launch_kwargs["env"] = launch_env
+            xvfb_wrapper_path = Path("/app/scripts/chromium_xvfb_wrapper.sh")
+            if xvfb_wrapper_path.exists():
+                launch_kwargs["executable_path"] = str(xvfb_wrapper_path)
+        else:
+            executable_path = resolve_browser_executable()
+            if executable_path:
+                launch_kwargs["executable_path"] = executable_path
         cookies = self._cookie_payload(profile)
         storage_state_path = self._storage_state_path(profile)
         browser: Browser | None = None
-        if cookies and storage_state_path:
-            browser = await playwright.chromium.launch(
-                headless=automation_settings.headless,
-                proxy=self._proxy_options(proxy),
-                executable_path=executable_path,
-                ignore_default_args=["--enable-automation"],
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = await browser.new_context(
-                viewport=viewport,
-                locale=antidetect.get("locale") or "en-US",
-                timezone_id=antidetect.get("timezone_id") or "UTC",
-                user_agent=antidetect.get("user_agent"),
-                color_scheme=antidetect.get("color_scheme") or "dark",
-                storage_state=storage_state_path,
-            )
-        else:
-            context = await playwright.chromium.launch_persistent_context(
-                profile.user_data_dir,
-                **launch_kwargs,
-            )
+        context = await playwright.chromium.launch_persistent_context(
+            profile.user_data_dir,
+            **launch_kwargs,
+        )
+        if cookies:
+            with suppress(Exception):
+                await context.add_cookies(cookies)
         await context.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -140,57 +168,28 @@ class BaseAutomationProvider(ABC):
                 antidetect.get("hardware_concurrency") or 8,
             )
         )
-        await context.add_init_script(
-            """
-            (() => {
-              const removeBanners = () => {
-                const selectors = [
-                  "#onetrust-consent-sdk",
-                  "#onetrust-banner-sdk",
-                  "#ot-sdk-container",
-                  "#onetrust-pc-sdk",
-                  "#onetrust-button-group-parent",
-                  "[id*='onetrust'][id*='sdk']",
-                  "[class*='onetrust']",
-                  "[id*='cookie']",
-                  "[class*='cookie']",
-                  "[data-cookie-banner='true']"
-                ];
-                const nodes = document.querySelectorAll(selectors.join(","));
-                nodes.forEach((node) => {
-                  node.remove();
-                });
-              };
-              new MutationObserver(removeBanners).observe(document.documentElement, {
-                childList: true,
-                subtree: true
-              });
-              removeBanners();
-            })();
-            """
-        )
         return context, playwright, False, browser
 
     async def _close_context(
         self,
+        profile: Profile,
         context: BrowserContext,
         playwright: object,
         connected_live_browser: bool,
         browser: Browser | None,
     ) -> None:
         if connected_live_browser:
-            # When attached to an already-running profile via CDP, do not close the
-            # browser and do not stop Playwright. In practice, stopping Playwright
-            # after a CDP attach can tear down the underlying live browser a few
-            # seconds later, which breaks both no-VNC runtime and manual bootstrap
-            # sessions.
-            return
-
-        with suppress(Exception):
-            await context.close()
-        if browser:
+            scheduled_timeout = schedule_profile_browser_stop(profile.id, live_browser_idle_timeout_seconds())
+            _emit_runtime_log(
+                "profile_browser_idle_scheduled "
+                f"profile_id={profile.id} provider={self.provider_name} idle_timeout_seconds={scheduled_timeout}"
+            )
+        else:
             with suppress(Exception):
-                await browser.close()
+                await context.close()
+            if browser:
+                with suppress(Exception):
+                    await browser.close()
         with suppress(Exception):
             await playwright.stop()
 
@@ -198,17 +197,28 @@ class BaseAutomationProvider(ABC):
         page.set_default_timeout(timeout_ms)
         await page.goto(self.start_url, wait_until="domcontentloaded")
 
-    async def _resolve_page(self, context: BrowserContext, timeout_ms: int) -> tuple[Page, bool]:
+    async def _resolve_page(
+        self,
+        context: BrowserContext,
+        timeout_ms: int,
+        *,
+        connected_live_browser: bool,
+    ) -> Page:
+        if not connected_live_browser:
+            page = await context.new_page()
+            page.set_default_timeout(timeout_ms)
+            return page
+
         start_host = urlparse(self.start_url).hostname or ""
         for page in context.pages:
             if start_host and start_host in page.url:
                 page.set_default_timeout(timeout_ms)
                 with suppress(Exception):
                     await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-                return page, False
+                return page
         page = context.pages[0] if context.pages else await context.new_page()
         page.set_default_timeout(timeout_ms)
-        return page, False
+        return page
 
     async def _capture_debug(self, page: Page, output_dir: Path, suffix: str) -> str:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -216,238 +226,64 @@ class BaseAutomationProvider(ABC):
         await page.screenshot(path=str(file_path), full_page=True)
         return str(file_path)
 
-    async def _dismiss_consent_overlays(self, page: Page) -> None:
-        selectors = [
-            "#onetrust-accept-btn-handler",
-            "#onetrust-reject-all-handler",
-            "#onetrust-pc-btn-handler",
-            "button:has-text('Accept All Cookies')",
-            "button:has-text('Accept all cookies')",
-            "button:has-text('Accept all')",
-            "button:has-text('Accept')",
-            "button:has-text('Reject')",
-            "button:has-text('Only necessary')",
-            "button:has-text('Not now')",
-            "button:has-text('Got it')",
-            "button:has-text('OK')",
-            "button[aria-label='Close']",
-            "button[aria-label='Dismiss']",
-            "[role='dialog'] button[aria-label='Close']",
-            "[data-cookie-banner] button[aria-label='Dismiss']",
-        ]
-        for _ in range(3):
-            for selector in selectors:
-                try:
-                    locator = page.locator(selector).first
-                    if await locator.count() > 0:
-                        await locator.click(timeout=1500, force=True)
-                        await page.wait_for_timeout(300)
-                except Exception:  # noqa: BLE001
-                    continue
-
-        with suppress(Exception):
-            await page.evaluate(
-                """
-                () => {
-                  const ids = [
-                    "onetrust-consent-sdk",
-                    "onetrust-banner-sdk",
-                    "ot-sdk-container",
-                    "onetrust-pc-sdk",
-                    "onetrust-button-group-parent",
-                    "dialog-portal"
-                  ];
-                  for (const id of ids) {
-                    const node = document.getElementById(id);
-                    if (node) {
-                      node.style.display = "none";
-                      node.style.pointerEvents = "none";
-                      node.remove();
-                    }
-                  }
-                  const overlays = document.querySelectorAll(
-                    [
-                      "[id*='onetrust'][id*='sdk']",
-                      "[class*='onetrust']",
-                      "[id*='cookie']",
-                      "[class*='cookie']",
-                      "[data-cookie-banner]",
-                      "[data-cookie-banner='true']",
-                      "#dialog-portal",
-                      "#dialog-portal > div[data-state='open'][aria-hidden='true']",
-                      "div[data-state='open'][aria-hidden='true'].bg-black\\/60",
-                      "div[data-state='open'][data-aria-hidden='true'].bg-black\\/60",
-                      "[data-radix-portal] div[data-state='open'][aria-hidden='true']"
-                    ].join(",")
-                  );
-                  overlays.forEach((node) => {
-                    const el = node;
-                    el.style.pointerEvents = "none";
-                    el.setAttribute("aria-hidden", "true");
-                    if (el && el.parentElement) {
-                      el.remove();
-                    }
-                  });
-                }
-                """
-            )
-        with suppress(Exception):
-            await page.add_style_tag(
-                content="""
-                #onetrust-consent-sdk,
-                #onetrust-banner-sdk,
-                #ot-sdk-container,
-                #onetrust-pc-sdk,
-                #onetrust-button-group-parent,
-                #dialog-portal,
-                [id*='onetrust'][id*='sdk'],
-                [class*='onetrust'],
-                [id*='cookie'],
-                [class*='cookie'],
-                [data-cookie-banner],
-                [data-cookie-banner='true'],
-                #dialog-portal > div[data-state='open'][aria-hidden='true'],
-                div[data-state='open'][aria-hidden='true'].bg-black\/60,
-                div[data-state='open'][data-aria-hidden='true'].bg-black\/60,
-                [data-radix-portal] div[data-state='open'][aria-hidden='true'] {
-                  pointer-events: none !important;
-                  visibility: hidden !important;
-                  opacity: 0 !important;
-                }
-                """
-            )
-
-    async def _first_visible(
-        self,
-        page: Page,
-        selectors: list[str],
-        *,
-        raise_on_empty: bool = True,
-        allow_hidden: bool = False,
-    ):
+    async def _first_visible(self, page: Page, selectors: list[str]):
         for selector in selectors:
             locator = page.locator(selector).first
             try:
                 await locator.wait_for(state="visible", timeout=5000)
                 return locator
             except Exception:  # noqa: BLE001
-                if allow_hidden and await locator.count() > 0:
+                if await locator.count() > 0:
                     return locator
-                with suppress(Exception):
-                    candidates = page.locator(selector)
-                    for index in range(await candidates.count()):
-                        candidate = candidates.nth(index)
-                        if await candidate.is_visible():
-                            return candidate
-        if raise_on_empty:
-            raise RuntimeError(f"No matching selector found: {selectors}")
-        return None
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            for selector in selectors:
+                locator = frame.locator(selector).first
+                try:
+                    await locator.wait_for(state="visible", timeout=5000)
+                    return locator
+                except Exception:  # noqa: BLE001
+                    if await locator.count() > 0:
+                        return locator
+        raise RuntimeError(f"No matching selector found: {selectors}")
 
     async def _fill_prompt(self, page: Page, selectors: list[str], value: str) -> None:
-        await self._dismiss_consent_overlays(page)
         try:
             locator = await self._first_visible(page, selectors)
-        except Exception:
-            fallback = page.locator(
-                ",".join(
-                    [
-                        "[role='textbox']",
-                        "div[role='textbox']",
-                        "[contenteditable='true']",
-                        "[contenteditable='plaintext-only']",
-                        "div[contenteditable='true']",
-                        "div[contenteditable='plaintext-only']",
-                        "textarea",
-                        "input[type='text']",
-                    ]
-                )
-            ).first
-            await fallback.wait_for(state="visible", timeout=5000)
-            locator = fallback
-
+        except RuntimeError:
+            locator = None
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                try:
+                    locator = await self._first_visible(frame, selectors)
+                    break
+                except Exception:
+                    continue
+            if locator is None:
+                await page.click("body")
+                await page.keyboard.type(value)
+                return
         tag_name = await locator.evaluate("(element) => element.tagName.toLowerCase()")
         content_editable = await locator.evaluate("(element) => element.isContentEditable")
         if tag_name in {"textarea", "input"}:
             await locator.fill(value)
             return
         if content_editable:
+            with suppress(Exception):
+                await locator.click()
             try:
-                await locator.click(timeout=2000, force=True)
+                is_active = await locator.evaluate("el => el === document.activeElement")
             except Exception:
-                await self._dismiss_consent_overlays(page)
+                is_active = False
+            if not is_active:
                 with suppress(Exception):
-                    await locator.click(timeout=2000, force=True)
+                    await page.keyboard.press("Escape")
                 with suppress(Exception):
-                    await locator.evaluate("(element) => element.focus()")
-            with suppress(Exception):
-                await locator.evaluate("(element) => element.focus()")
-            with suppress(Exception):
-                await page.keyboard.press("Control+A")
-                await page.keyboard.insert_text(value)
-                await page.wait_for_timeout(300)
-
-            current_text = ""
-            with suppress(Exception):
-                current_text = await locator.evaluate(
-                    "(element) => (element.innerText || element.textContent || '').trim()"
-                )
-
-            if current_text.strip() != value.strip():
-                with suppress(Exception):
-                    await locator.evaluate(
-                        """
-                        (element, text) => {
-                          element.focus();
-                          document.execCommand("selectAll", false, null);
-                          document.execCommand("insertText", false, text);
-                          element.dispatchEvent(new InputEvent("input", {
-                            inputType: "insertText",
-                            data: text,
-                            bubbles: true,
-                          }));
-                        }
-                        """,
-                        value,
-                    )
-                    await page.wait_for_timeout(300)
-
-            with suppress(Exception):
-                current_text = await locator.evaluate(
-                    "(element) => (element.innerText || element.textContent || '').trim()"
-                )
-
-            if current_text.strip() != value.strip():
-                await locator.evaluate(
-                    """
-                    (element, text) => {
-                      element.focus();
-                      if (element.isContentEditable) {
-                        element.innerHTML = "";
-                        const paragraph = document.createElement("p");
-                        paragraph.textContent = text;
-                        element.appendChild(paragraph);
-                        element.dispatchEvent(new InputEvent("beforeinput", {
-                          inputType: "insertText",
-                          data: text,
-                          bubbles: true,
-                          cancelable: true,
-                        }));
-                        element.dispatchEvent(new InputEvent("input", {
-                          inputType: "insertText",
-                          data: text,
-                          bubbles: true,
-                        }));
-                        element.dispatchEvent(new Event("change", { bubbles: true }));
-                      }
-                    }
-                    """,
-                    value,
-                )
-                with suppress(Exception):
-                    await page.keyboard.press("End")
-                with suppress(Exception):
-                    await page.keyboard.insert_text(" ")
-                    await page.keyboard.press("Backspace")
+                    await locator.click(force=True)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.type(value)
             return
         await locator.fill(value)
 
@@ -499,6 +335,7 @@ class BaseAutomationProvider(ABC):
             "page has been closed",
             "session closed",
             "closed unexpectedly",
+            "submit button stayed disabled before click",
         ]
         return any(pattern in message for pattern in patterns)
 
@@ -511,6 +348,13 @@ class BaseAutomationProvider(ABC):
         *,
         prefer_live_browser: bool,
     ) -> dict:
+        started_at = time.perf_counter()
+        launch_mode = "live-browser" if prefer_live_browser else ("headed" if not automation_settings.headless else "headless")
+        _emit_runtime_log(
+            "browser_job_start "
+            f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+            f"target={job.target.value} mode={launch_mode}"
+        )
         context, playwright, connected_live_browser, browser = await self._open_context(
             profile,
             proxy,
@@ -518,45 +362,68 @@ class BaseAutomationProvider(ABC):
             prefer_live_browser=prefer_live_browser,
         )
         page: Page | None = None
-        result_page: Page | None = None
-        additional_pages_to_close: list[Page] = []
-        created_fresh_page = False
         try:
-            page, created_fresh_page = await self._resolve_page(context, automation_settings.timeout_ms)
-            if not connected_live_browser or page.url in {"", "about:blank"}:
-                await self._prepare_page(page, automation_settings.timeout_ms)
-            else:
-                with suppress(Exception):
-                    await page.wait_for_load_state("domcontentloaded", timeout=automation_settings.timeout_ms)
-            result = await self.perform(page, profile, job, automation_settings)
-            custom_result_page = result.pop("_result_page", None)
-            custom_close_pages = result.pop("_close_pages", None)
-            if isinstance(custom_result_page, Page):
-                result_page = custom_result_page
-            if isinstance(custom_close_pages, list):
-                additional_pages_to_close = [item for item in custom_close_pages if isinstance(item, Page)]
-            debug_page = result_page or page
-            screenshot = await self._capture_debug(
-                debug_page,
-                profile_storage.output_dir(profile.id),
-                f"{job.id}-final",
+            _emit_runtime_log(
+                "browser_context_opened "
+                f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+                f"live={connected_live_browser}"
             )
+            page = await self._resolve_page(
+                context,
+                automation_settings.timeout_ms,
+                connected_live_browser=connected_live_browser,
+            )
+            await self._prepare_page(page, automation_settings.timeout_ms)
+            result = await self.perform(page, profile, job, automation_settings)
+            screenshot = await self._capture_debug(page, profile_storage.output_dir(profile.id), f"{job.id}-final")
             result["provider"] = self.provider_name
             result["start_url"] = self.start_url
-            result["page_url"] = debug_page.url
+            result["page_url"] = page.url
             result["debug_screenshot"] = screenshot
             result["used_live_browser"] = connected_live_browser
+            _emit_runtime_log(
+                "browser_job_succeeded "
+                f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+                f"duration_ms={int((time.perf_counter() - started_at) * 1000)} "
+                f"media_count={len(result.get('media_urls') or [])}"
+            )
             return result
-        finally:
-            for extra_page in additional_pages_to_close:
-                if page is not None and extra_page == page:
-                    continue
+        except Exception as exc:
+            if page is not None:
                 with suppress(Exception):
-                    await extra_page.close()
-            if page is not None and (created_fresh_page or not connected_live_browser):
+                    failure_screenshot = await self._capture_debug(
+                        page,
+                        profile_storage.output_dir(profile.id),
+                        f"{job.id}-failed",
+                    )
+                    _emit_runtime_log(
+                        "browser_job_failure_screenshot "
+                        f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+                        f"path={failure_screenshot}"
+                    )
+            _emit_runtime_log(
+                "browser_job_failed "
+                f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+                f"duration_ms={int((time.perf_counter() - started_at) * 1000)}"
+            )
+            logger.exception(
+                "browser_job_failed provider=%s job_id=%s profile_id=%s duration_ms=%s",
+                self.provider_name,
+                job.id,
+                profile.id,
+                int((time.perf_counter() - started_at) * 1000),
+            )
+            raise exc
+        finally:
+            if page is not None and not connected_live_browser:
                 with suppress(Exception):
                     await page.close()
-            await self._close_context(context, playwright, connected_live_browser, browser)
+            await self._close_context(profile, context, playwright, connected_live_browser, browser)
+            _emit_runtime_log(
+                "browser_context_closed "
+                f"provider={self.provider_name} job_id={job.id} profile_id={profile.id} "
+                f"live={connected_live_browser} duration_ms={int((time.perf_counter() - started_at) * 1000)}"
+            )
 
     async def run(
         self,
@@ -565,13 +432,16 @@ class BaseAutomationProvider(ABC):
         job: AutomationJob,
         automation_settings: AutomationSettings,
     ) -> dict:
+        prefer_live_browser = settings.reuse_live_browser_for_jobs
+        if self.provider_name == "grok" and warm_browser_reuse_enabled():
+            prefer_live_browser = True
         try:
             return await self._run_once(
                 profile,
                 proxy,
                 job,
                 automation_settings,
-                prefer_live_browser=True,
+                prefer_live_browser=prefer_live_browser,
             )
         except Exception as exc:  # noqa: BLE001
             if not self._should_retry_without_live_browser(exc):
@@ -598,7 +468,11 @@ class BaseAutomationProvider(ABC):
         )
         page: Page | None = None
         try:
-            page, _ = await self._resolve_page(context, automation_settings.timeout_ms)
+            page = await self._resolve_page(
+                context,
+                automation_settings.timeout_ms,
+                connected_live_browser=connected_live_browser,
+            )
             if not connected_live_browser or page.url in {"", "about:blank"}:
                 await self._prepare_page(page, automation_settings.timeout_ms)
             else:
@@ -630,7 +504,7 @@ class BaseAutomationProvider(ABC):
             if page is not None and not connected_live_browser:
                 with suppress(Exception):
                     await page.close()
-            await self._close_context(context, playwright, connected_live_browser, browser)
+            await self._close_context(profile, context, playwright, connected_live_browser, browser)
 
     def capability_payload(self, category: str) -> dict:
         return {
