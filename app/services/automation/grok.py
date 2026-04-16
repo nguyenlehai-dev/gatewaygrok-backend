@@ -1010,6 +1010,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             r"""
             () => {
               const body = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+              const html = (document.documentElement?.innerHTML || "").slice(0, 200000);
               const normalized = body.toLowerCase();
               const hasDownload = Array.from(document.querySelectorAll("button"))
                 .some((button) => {
@@ -1024,6 +1025,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 const src = video.currentSrc || video.src || "";
                 return Boolean(src);
               });
+              const htmlHasVideoUrl =
+                html.includes(".mp4") ||
+                html.includes("generated_video") ||
+                html.includes("share-videos/");
               const generating =
                 normalized.includes("cancel video") ||
                 normalized.includes("generating") ||
@@ -1034,6 +1039,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 progress: percentMatch ? percentMatch[1] : null,
                 hasDownload,
                 hasVideo,
+                htmlHasVideoUrl,
                 body: body.slice(0, 1000),
               };
             }
@@ -1069,6 +1075,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 push(media.getAttribute("data-href") || "");
               }
 
+              const html = document.documentElement?.innerHTML || "";
+              const regex = /https?:\/\/[^"'\\s<>]+(?:generated_video[^"'\\s<>]*|share-videos\/[^"'\\s<>]+\.mp4[^"'\\s<>]*)/gi;
+              for (const match of html.matchAll(regex)) {
+                push(match[0] || "");
+              }
+
+              const looseMp4Regex = /https?:\/\/[^"'\\s<>]+\.mp4[^"'\\s<>]*/gi;
+              for (const match of html.matchAll(looseMp4Regex)) {
+                push(match[0] || "");
+              }
+
               return values;
             }
             """
@@ -1101,9 +1118,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
 
             state = await self._video_generation_state(page)
             if isinstance(state, dict):
-                if state.get("hasDownload"):
+                if state.get("hasVideo") or state.get("htmlHasVideoUrl"):
                     self._log_job_step(job, "video_ready_download_visible")
                     return []
+                if state.get("hasDownload"):
+                    self._log_job_step(job, "video_download_visible_without_video")
                 if state.get("generating"):
                     progress = state.get("progress") or "unknown"
                     self._log_job_step(job, f"video_generation_in_progress progress={progress}")
