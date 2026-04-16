@@ -422,30 +422,87 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     collected.push({ src: src.trim(), score });
                   };
 
-                  for (const video of Array.from(document.querySelectorAll("video")).filter(visible)) {
-                    const rect = video.getBoundingClientRect();
-                    const score = Math.round(rect.width * rect.height) + Math.round(rect.height * 10);
-                    push(video.currentSrc || video.src || "", score);
-                    for (const source of Array.from(video.querySelectorAll("source"))) {
-                      push(source.src || "", score - 1);
+                  const viewportCenterX = window.innerWidth / 2;
+                  const viewportCenterY = window.innerHeight / 2;
+                  const scoreRect = (rect) => {
+                    const area = Math.round(rect.width * rect.height);
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    const distance = Math.hypot(centerX - viewportCenterX, centerY - viewportCenterY);
+                    return area - Math.round(distance * 120);
+                  };
+                  const mediaSelectors = "video, a[href*='.mp4'], a[href*='share-videos/'], [src*='.mp4'], [data-url*='.mp4'], [data-href*='.mp4']";
+                  const readNodeUrls = (root) => {
+                    const values = [];
+                    const add = (value, score) => {
+                      if (typeof value !== "string" || !value.trim()) return;
+                      values.push({ src: value.trim(), score });
+                    };
+                    for (const node of Array.from(root.querySelectorAll(mediaSelectors))) {
+                      const host = node instanceof HTMLElement ? node : node.parentElement;
+                      if (host instanceof HTMLElement && !visible(host) && node.tagName !== "VIDEO") continue;
+                      const rect = host instanceof HTMLElement ? host.getBoundingClientRect() : root.getBoundingClientRect();
+                      const score = scoreRect(rect);
+                      if (node instanceof HTMLVideoElement) {
+                        add(node.currentSrc || node.src || "", score);
+                        for (const source of Array.from(node.querySelectorAll("source"))) {
+                          add(source.src || "", score - 1);
+                        }
+                        continue;
+                      }
+                      add(node.getAttribute?.("href") || "", score);
+                      add(node.getAttribute?.("src") || "", score);
+                      add(node.getAttribute?.("data-url") || "", score);
+                      add(node.getAttribute?.("data-href") || "", score);
+                    }
+                    return values;
+                  };
+
+                  const visibleVideos = Array.from(document.querySelectorAll("video"))
+                    .filter(visible)
+                    .map((video) => {
+                      const rect = video.getBoundingClientRect();
+                      return { video, rect, score: scoreRect(rect) };
+                    })
+                    .sort((left, right) => right.score - left.score);
+
+                  const bestVideo = visibleVideos[0]?.video || null;
+                  if (bestVideo instanceof HTMLElement) {
+                    const ancestors = [];
+                    let current = bestVideo.parentElement;
+                    while (current instanceof HTMLElement && current !== document.body) {
+                      ancestors.push(current);
+                      current = current.parentElement;
+                    }
+
+                    for (const container of ancestors) {
+                      if (!visible(container)) continue;
+                      const rect = container.getBoundingClientRect();
+                      if (rect.width < 220 || rect.height < 180) continue;
+                      if (rect.width > window.innerWidth * 0.96 && rect.height > window.innerHeight * 0.96) continue;
+                      const values = readNodeUrls(container);
+                      const uniqueCount = new Set(values.map((item) => item.src)).size;
+                      if (uniqueCount >= 1 && uniqueCount <= 4) {
+                        collected.push(...values);
+                        break;
+                      }
+                    }
+
+                    if (!collected.length) {
+                      push(bestVideo.currentSrc || bestVideo.getAttribute("src") || "", visibleVideos[0].score);
+                      for (const source of Array.from(bestVideo.querySelectorAll("source"))) {
+                        push(source.src || "", visibleVideos[0].score - 1);
+                      }
                     }
                   }
 
-                  const mediaNodes = Array.from(
-                    document.querySelectorAll("a[href*='.mp4'], a[href*='share-videos/'], [src*='.mp4'], [data-url*='.mp4'], [data-href*='.mp4']")
-                  );
-                  for (const node of mediaNodes) {
-                    const host = node instanceof HTMLElement ? node : node.parentElement;
-                    const visibleHost = host instanceof HTMLElement
-                      ? (visible(host) ? host : host.closest("article, section, main, div"))
-                      : null;
-                    if (!(visibleHost instanceof HTMLElement) || !visible(visibleHost)) continue;
-                    const rect = visibleHost.getBoundingClientRect();
-                    const score = Math.round(rect.width * rect.height);
-                    push(node.getAttribute?.("href") || "", score);
-                    push(node.getAttribute?.("src") || "", score);
-                    push(node.getAttribute?.("data-url") || "", score);
-                    push(node.getAttribute?.("data-href") || "", score);
+                  if (!collected.length) {
+                    for (const item of visibleVideos.slice(0, 2)) {
+                      push(item.video.currentSrc || item.video.src || "", item.score);
+                      for (const source of Array.from(item.video.querySelectorAll("source"))) {
+                        push(source.src || "", item.score - 1);
+                      }
+                    }
                   }
 
                   collected.sort((left, right) => right.score - left.score);
@@ -1320,6 +1377,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
 
     async def _extract_ready_video_urls(self, page: Page) -> list[str]:
+        focused_urls = await self._extract_media_urls(page, "video")
+        if focused_urls:
+            return self._normalize_media_urls(focused_urls, "video")
+
         urls = await page.evaluate(
             r"""
             () => {
@@ -1337,11 +1398,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 }
               }
 
-              for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
+              for (const anchor of Array.from(document.querySelectorAll("main a[href], [role='main'] a[href]"))) {
                 push(anchor.href || "");
               }
 
-              for (const media of Array.from(document.querySelectorAll("[src], [data-url], [data-href]"))) {
+              for (const media of Array.from(document.querySelectorAll("main [src], main [data-url], main [data-href], [role='main'] [src], [role='main'] [data-url], [role='main'] [data-href]"))) {
                 if (!(media instanceof HTMLElement)) continue;
                 push(media.getAttribute("src") || "");
                 push(media.getAttribute("data-url") || "");
@@ -1383,7 +1444,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             if blocked_message:
                 raise ContentPolicyBlockedError(blocked_message)
 
-            media_urls = self._normalize_media_urls(await super()._extract_media_urls(page, "video"), "video")
+            media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
             if not media_urls:
                 media_urls = await self._extract_ready_video_urls(page)
             media_urls = self._filter_new_media_urls(media_urls, baseline_urls)
@@ -1836,7 +1897,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
                         network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
-                    if network_video_urls:
+                    if network_video_urls and not media_urls:
                         media_urls = network_video_urls
                     if not media_urls:
                         media_urls = await self._extract_ready_video_urls(page)
