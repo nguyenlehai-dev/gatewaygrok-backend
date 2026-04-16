@@ -37,6 +37,26 @@ class GrokAutomationProvider(BaseAutomationProvider):
             flush=True,
         )
 
+    def _extract_post_url(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        text = str(value).strip()
+        if "/imagine/post/" not in text:
+            return None
+        return text
+
+    async def _wait_for_new_post_url(self, page: Page, previous_url: str | None, *, timeout_ms: int = 90000) -> str | None:
+        previous_post_url = self._extract_post_url(previous_url)
+        elapsed = 0
+        while elapsed < timeout_ms:
+            current_url = page.url
+            current_post_url = self._extract_post_url(current_url)
+            if current_post_url and current_post_url != previous_post_url:
+                return current_post_url
+            await page.wait_for_timeout(1000)
+            elapsed += 1000
+        return self._extract_post_url(page.url)
+
     def _coerce_image_to_video_prompt(self, prompt: str) -> str:
         normalized = " ".join((prompt or "").split()).strip()
         if not normalized:
@@ -1495,11 +1515,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     raise SubmitButtonDisabledError(
                         f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
                     ) from exc
+                submitted_from_url = page.url
                 await self._click_submit_button(page, submit, flow_label=video_mode.replace("_", "-"))
                 await page.wait_for_timeout(1500)
                 blocked_message = await self._detect_content_policy_block(page, "video")
                 if blocked_message:
                     raise ContentPolicyBlockedError(blocked_message)
+                submitted_post_url = await self._wait_for_new_post_url(page, submitted_from_url)
+                if submitted_post_url:
+                    option_state["submitted_post_url"] = submitted_post_url
                 return option_state
             except SubmitButtonDisabledError as exc:
                 last_exc = exc
@@ -1750,6 +1774,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     timeout=180 if video_mode == "image_to_video" else 150,
                 )
                 self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
+                submitted_post_url = option_state.get("submitted_post_url") if isinstance(option_state, dict) else None
+                if isinstance(submitted_post_url, str) and submitted_post_url:
+                    with suppress(Exception):
+                        await page.goto(submitted_post_url, wait_until="domcontentloaded")
+                        await page.wait_for_timeout(1200)
                 media_urls: list[str] = []
                 media_urls = await self._wait_for_video_ready(
                     page,
@@ -1814,6 +1843,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     "applied_options": option_state.get("applied", {}),
                     "unapplied_options": option_state.get("unapplied", {}),
                     "media_urls": media_urls,
+                    "submitted_post_url": submitted_post_url,
                 }
 
         option_state = await self._open_imagine_image_flow(
