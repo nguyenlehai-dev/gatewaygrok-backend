@@ -1429,6 +1429,56 @@ class GrokAutomationProvider(BaseAutomationProvider):
         normalized = [str(url).strip() for url in urls if str(url).strip()]
         return self._normalize_media_urls(normalized, "video")
 
+    async def _extract_submitted_post_video_urls(self, page: Page, submitted_post_url: str | None) -> list[str]:
+        urls = await page.evaluate(
+            r"""
+            async (submittedPostUrl) => {
+              const values = [];
+              const push = (value) => {
+                if (typeof value === "string" && value.trim()) {
+                  values.push(value.trim());
+                }
+              };
+              const collectFromHtml = (html) => {
+                if (typeof html !== "string" || !html) return;
+                const ogVideo = /<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/gi;
+                for (const match of html.matchAll(ogVideo)) {
+                  push(match[1] || "");
+                }
+                const twitterStream = /<meta[^>]+name=["']twitter:player:stream["'][^>]+content=["']([^"']+)["']/gi;
+                for (const match of html.matchAll(twitterStream)) {
+                  push(match[1] || "");
+                }
+                const looseVideo = /https?:\/\/[^"'\\s<>]+share-videos\/[^"'\\s<>]+\.mp4[^"'\\s<>]*/gi;
+                for (const match of html.matchAll(looseVideo)) {
+                  push(match[0] || "");
+                }
+              };
+
+              for (const meta of Array.from(document.querySelectorAll('meta[property=\"og:video\"], meta[name=\"twitter:player:stream\"]'))) {
+                push(meta.getAttribute("content") || "");
+              }
+              collectFromHtml(document.head?.innerHTML || "");
+
+              if (submittedPostUrl) {
+                try {
+                  const response = await fetch(submittedPostUrl, { credentials: "include" });
+                  if (response.ok) {
+                    collectFromHtml(await response.text());
+                  }
+                } catch (error) {
+                  void error;
+                }
+              }
+              return values;
+            }
+            """,
+            submitted_post_url,
+        )
+        if not isinstance(urls, list):
+            return []
+        return self._normalize_media_urls([str(url).strip() for url in urls if str(url).strip()], "video")
+
     async def _wait_for_video_ready(
         self,
         page: Page,
@@ -1903,6 +1953,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                     )
+                    post_video_urls = await self._extract_submitted_post_video_urls(page, submitted_post_url)
+                    if isinstance(baseline_video_urls, list):
+                        post_video_urls = self._filter_new_media_urls(post_video_urls, baseline_video_urls)
+                    if post_video_urls:
+                        self._log_job_step(job, f"submitted_post_video_detected media_count={len(post_video_urls)}")
+                        media_urls = post_video_urls
                     state = await self._video_generation_state(page)
                     if isinstance(state, dict) and (state.get("hasDownload") or state.get("hasVideo")):
                         self._log_job_step(job, "direct_video_download_preferred")
