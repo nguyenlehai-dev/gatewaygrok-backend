@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Etc/UTC
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends x11vnc \
+    && apt-get install -y --no-install-recommends x11vnc tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -18,4 +18,7 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+RUN chmod +x /app/scripts/start_api.sh
+
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
+CMD ["/app/scripts/start_api.sh"]

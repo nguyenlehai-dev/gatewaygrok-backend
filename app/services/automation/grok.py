@@ -1,16 +1,28 @@
 import base64
-import re
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import Page
 
+from app.core.config import settings
 from app.models.automation_job import AutomationJob
 from app.models.profile import Profile
 from app.schemas.setting import AutomationSettings
 from app.services.automation.base import BaseAutomationProvider
 from app.services.profile_storage import profile_storage
+
+
+class ContentPolicyBlockedError(RuntimeError):
+    """Raised when Grok rejects the prompt due to safety/content policy."""
+
+
+class SubmitButtonDisabledError(RuntimeError):
+    """Raised when Grok never enables the submit button for the current form state."""
+
+
+class InvalidVideoOutputError(RuntimeError):
+    """Raised when a video generation flow returns non-video output."""
 
 
 class GrokAutomationProvider(BaseAutomationProvider):
@@ -38,8 +50,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 const parentClass = String(parent?.className || "");
                 const grandParentClass = String(grandParent?.className || "");
                 const visible =
-                  rect.width >= 280 &&
-                  rect.height >= 280 &&
+                  rect.width >= 160 &&
+                  rect.height >= 180 &&
                   rect.bottom > 0 &&
                   rect.right > 0 &&
                   style.display !== "none" &&
@@ -54,7 +66,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                   continue;
                 }
 
-                if (image.naturalWidth < 700 || image.naturalHeight < 900) {
+                if (image.naturalWidth < 400 || image.naturalHeight < 400) {
                   continue;
                 }
 
@@ -155,91 +167,545 @@ class GrokAutomationProvider(BaseAutomationProvider):
             filtered.append(normalized)
         return filtered
 
-    async def _wait_for_action_button(self, page: Page, selectors: list[str], attempts: int = 18, delay_ms: int = 5000):
+    async def _detect_content_policy_block(self, page: Page, target: str) -> str | None:
+        text = await page.evaluate(
+            r"""
+            () => {
+              const nodes = Array.from(
+                document.querySelectorAll('[role="alert"], [role="status"], [role="dialog"], [aria-live], main, body')
+              );
+              const joined = nodes
+                .map((node) => (node instanceof HTMLElement ? node.innerText || "" : ""))
+                .join("\n")
+                .replace(/\s+/g, " ")
+                .trim();
+              return joined.slice(0, 12000);
+            }
+            """
+        )
+        normalized = str(text or "").lower()
+        if not normalized:
+            return None
+
+        direct_phrases = [
+            "content policy",
+            "safety policy",
+            "violates our policy",
+            "violates our policies",
+            "can't help with that",
+            "cannot help with that",
+            "can't generate that",
+            "cannot generate that",
+            "can't create that",
+            "cannot create that",
+            "request was blocked",
+            "request has been blocked",
+            "sensitive content",
+            "sexual content",
+            "sexually explicit",
+            "nudity",
+            "adult content",
+            "18+",
+            "nsfw",
+        ]
+        if any(phrase in normalized for phrase in direct_phrases):
+            return (
+                f"Grok stopped this {target} job because the prompt appears to be restricted by safety/content policy. "
+                "If this is 18+ or explicit content, stop and revise the prompt."
+            )
+
+        token_groups = [
+            ("policy", "violat"),
+            ("safety", "violat"),
+            ("content", "restricted"),
+            ("content", "blocked"),
+            ("sexual", "not allowed"),
+            ("explicit", "not allowed"),
+            ("adult", "not allowed"),
+        ]
+        if any(all(token in normalized for token in group) for group in token_groups):
+            return (
+                f"Grok rejected this {target} job due to content restrictions. "
+                "If the request is 18+ or explicit, stop the job and change the prompt."
+            )
+
+        return None
+
+    async def _detect_hidden_media_block(self, page: Page, target: str) -> str | None:
+        details = await page.evaluate(
+            r"""
+            () => {
+              const isVisible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width >= 180 &&
+                  rect.height >= 180 &&
+                  rect.bottom > 0 &&
+                  rect.right > 0 &&
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  Number(style.opacity || "1") > 0.05
+                );
+              };
+
+              const images = Array.from(document.querySelectorAll("img"))
+                .filter((img) => isVisible(img))
+                .map((img) => {
+                  const rect = img.getBoundingClientRect();
+                  const style = window.getComputedStyle(img);
+                  return {
+                    width: rect.width,
+                    height: rect.height,
+                    filter: String(style.filter || ""),
+                    className: String(img.className || ""),
+                  };
+                });
+
+              const blurredLargeImage = images.some((img) => {
+                const text = `${img.filter} ${img.className}`.toLowerCase();
+                return img.width >= 320 && img.height >= 320 && (text.includes("blur") || text.includes("hidden"));
+              });
+
+              const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000).toLowerCase();
+              const eyeSlashIcon = Array.from(document.querySelectorAll("svg"))
+                .some((svg) => {
+                  const rect = svg.getBoundingClientRect();
+                  return rect.width >= 36 && rect.height >= 36 && rect.width <= 140 && rect.height <= 140;
+                });
+
+              return {
+                blurredLargeImage,
+                eyeSlashIcon,
+                bodyText,
+              };
+            }
+            """
+        )
+        if not isinstance(details, dict):
+            return None
+
+        body_text = str(details.get("bodyText") or "")
+        blocked_phrases = [
+            "sensitive",
+            "not available",
+            "not visible",
+            "cannot be shown",
+            "can't be shown",
+            "hidden",
+            "blocked",
+        ]
+        if any(phrase in body_text for phrase in blocked_phrases):
+            return (
+                f"Grok hid or blocked this {target} result before the next action became available. "
+                "This is likely due to safety/content restrictions."
+            )
+
+        if details.get("blurredLargeImage") and details.get("eyeSlashIcon"):
+            return (
+                f"Grok blurred or hid the generated {target} result before video conversion. "
+                "This is likely a sensitive-content or policy restriction."
+            )
+
+        return None
+
+    async def _wait_for_action_button(
+        self,
+        page: Page,
+        selectors: list[str],
+        attempts: int = 18,
+        delay_ms: int = 5000,
+        *,
+        policy_target: str | None = None,
+    ):
         for _ in range(attempts):
             for selector in selectors:
                 locator = page.locator(selector).first
                 if await locator.count() > 0:
                     return locator
+            if policy_target:
+                blocked_message = await self._detect_content_policy_block(page, policy_target)
+                if blocked_message:
+                    raise ContentPolicyBlockedError(blocked_message)
+                hidden_message = await self._detect_hidden_media_block(page, policy_target)
+                if hidden_message:
+                    raise ContentPolicyBlockedError(hidden_message)
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
-    async def _set_aspect_ratio(self, page: Page, aspect_ratio: str | None) -> None:
-        if not aspect_ratio:
-            return
-        ratio = aspect_ratio.strip()
-        if not ratio:
-            return
+    async def _try_click_matching_option(self, page: Page, values: list[str]) -> bool:
+        normalized_values = [value.strip() for value in values if value and value.strip()]
+        if not normalized_values:
+            return False
 
-        ratio_pattern = re.compile(r"\b\d+:\d+\b")
-        with suppress(Exception):
-            current = page.locator("button", has_text=ratio_pattern).first
-            if await current.count() > 0:
-                text = (await current.inner_text()).strip()
-                if ratio in text:
-                    return
+        selectors: list[str] = []
+        for value in normalized_values:
+            selectors.extend(
+                [
+                    f"button[role='option']:has-text('{value}')",
+                    f"button[role='radio']:has-text('{value}')",
+                    f"[role='option']:has-text('{value}')",
+                    f"[role='menuitemradio']:has-text('{value}')",
+                    f"label:has-text('{value}')",
+                    f"button:has-text('{value}')",
+                    f"text='{value}'",
+                ]
+            )
 
-        trigger_selectors = [
-            f"button:has-text('{ratio}')",
-            "button[aria-label*='ratio' i]",
-            "button[aria-label*='aspect' i]",
-            "button[role='combobox']",
-        ]
-        trigger = None
-        for selector in trigger_selectors:
+        for selector in selectors:
             locator = page.locator(selector).first
-            if await locator.count() > 0:
-                trigger = locator
-                break
-        if trigger is None:
-            trigger = page.locator("button", has_text=ratio_pattern).first
-        if trigger and await trigger.count() > 0:
-            with suppress(Exception):
-                await trigger.click()
-                await page.wait_for_timeout(200)
-
-        option_selectors = [
-            f"[role='menuitem']:has-text('{ratio}')",
-            f"[role='option']:has-text('{ratio}')",
-            f"button:has-text('{ratio}')",
-            f"div:has-text('{ratio}')",
-            f"li:has-text('{ratio}')",
-        ]
-        for selector in option_selectors:
-            locator = page.locator(selector).first
-            if await locator.count() > 0:
-                with suppress(Exception):
-                    await locator.click()
-                    await page.wait_for_timeout(200)
-                    return
-
-    async def _dismiss_quality_popup(self, page: Page) -> None:
-        popup_label = "Choose quality for detailed generations"
-        with suppress(Exception):
-            popup = page.locator(f"text={popup_label}").first
-            if await popup.count() == 0:
-                return
-
-            close_selectors = [
-                "button:has-text('Got it')",
-                "button:has-text('Close')",
-                "button:has-text('Dismiss')",
-                "button[aria-label='Close']",
-                "div[data-radix-popper-content-wrapper] button",
-            ]
-            for selector in close_selectors:
-                locator = page.locator(selector).first
+            try:
                 if await locator.count() > 0:
-                    with suppress(Exception):
-                        await locator.click()
-                        await page.wait_for_timeout(300)
-                        return
+                    await locator.click(timeout=1500)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
 
+    async def _try_open_dropdown(self, page: Page, labels: list[str]) -> bool:
+        selectors: list[str] = []
+        for label in labels:
+            selectors.extend(
+                [
+                    f"button[aria-label*='{label}' i]",
+                    f"[aria-label*='{label}' i] button",
+                    f"button:has-text('{label}')",
+                    f"label:has-text('{label}')",
+                    f"[role='button']:has-text('{label}')",
+                    f"text='{label}'",
+                ]
+            )
+
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if await locator.count() > 0:
+                    await locator.click(timeout=1500)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    async def _read_submit_disabled_reason(self, page: Page) -> str:
+        return await page.evaluate(
+            r"""
+            () => {
+              const button =
+                document.querySelector("button[aria-label='Submit']") ||
+                document.querySelector("button[type='submit']");
+              if (!(button instanceof HTMLButtonElement)) {
+                return "submit button not found";
+              }
+              const hints = [];
+              if (button.disabled) {
+                hints.push("submit button is disabled");
+              }
+              const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000).toLowerCase();
+              const phrases = [
+                "add a prompt",
+                "enter a prompt",
+                "type a prompt",
+                "upload",
+                "image",
+                "unsupported",
+                "not available",
+                "try again",
+              ];
+              for (const phrase of phrases) {
+                if (text.includes(phrase)) {
+                  hints.push(`page contains: ${phrase}`);
+                }
+              }
+              return hints.join("; ") || "submit button stayed disabled";
+            }
+            """
+        )
+
+    async def _find_submit_button(self, page: Page):
+        selectors = [
+            "button[aria-label='Submit']",
+            "button[aria-label*='Submit' i]",
+            "button[aria-label*='Send' i]",
+            "button[aria-label*='Generate' i]",
+            "button[aria-label*='Create' i]",
+            "button[aria-label*='Imagine' i]",
+            "button[title*='Submit' i]",
+            "button[title*='Send' i]",
+            "button[title*='Generate' i]",
+            "button:has-text('Generate')",
+            "button:has-text('Create')",
+            "button:has-text('Make')",
+            "button:has-text('Submit')",
+            "button[type='submit']",
+        ]
+        with suppress(Exception):
+            return await self._first_visible(page, selectors)
+
+        candidate_index = await page.evaluate(
+            r"""
+            () => {
+              const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+              const isVisible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                  rect.width >= 24 &&
+                  rect.height >= 24 &&
+                  rect.bottom > 0 &&
+                  rect.right > 0 &&
+                  style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  Number(style.opacity || '1') > 0.05
+                );
+              };
+              const scoreButton = (button) => {
+                if (!(button instanceof HTMLElement) || !isVisible(button)) {
+                  return -1;
+                }
+                const rect = button.getBoundingClientRect();
+                const text = [
+                  button.innerText || '',
+                  button.getAttribute('aria-label') || '',
+                  button.getAttribute('title') || '',
+                ].join(' ').toLowerCase();
+                const disabled =
+                  (button instanceof HTMLButtonElement && button.disabled) ||
+                  button.getAttribute('aria-disabled') === 'true';
+                let score = 0;
+                if (button instanceof HTMLButtonElement && button.type === 'submit') score += 300;
+                if (button.getAttribute('role') === 'button') score += 80;
+                if (text.includes('submit')) score += 250;
+                if (text.includes('send')) score += 220;
+                if (text.includes('generate')) score += 220;
+                if (text.includes('create')) score += 180;
+                if (text.includes('imagine')) score += 160;
+                if (!text.trim()) score += 80;
+                if (disabled) score -= 120;
+                if (rect.bottom >= window.innerHeight - 220) score += 120;
+                if (rect.right >= window.innerWidth - 260) score += 80;
+                if (rect.width <= 80 && rect.height <= 80) score += 30;
+                if (button.closest("form")) score += 70;
+                if (button.closest("[role='toolbar']")) score -= 40;
+                if (button.closest("aside")) score -= 120;
+                return score;
+              };
+              let bestIndex = -1;
+              let bestScore = -1;
+              buttons.forEach((button, index) => {
+                const score = scoreButton(button);
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestIndex = index;
+                }
+              });
+              return bestScore >= 180 ? bestIndex : -1;
+            }
+            """
+        )
+        if isinstance(candidate_index, int) and candidate_index >= 0:
+            locator = page.locator('button, [role="button"]').nth(candidate_index)
+            if await locator.count() > 0:
+                return locator
+        raise RuntimeError("submit button not found")
+
+    async def _wait_for_enabled_submit_button(self, page: Page, flow_label: str, attempts: int = 12, delay_ms: int = 1000):
+        submit = await self._find_submit_button(page)
+        for _ in range(attempts):
+            blocked_message = await self._detect_content_policy_block(page, flow_label)
+            if blocked_message:
+                raise ContentPolicyBlockedError(blocked_message)
+            enabled = False
+            with suppress(Exception):
+                enabled = await submit.is_enabled(timeout=1000)
+            if enabled:
+                return submit
+            await page.wait_for_timeout(delay_ms)
+        reason = await self._read_submit_disabled_reason(page)
+        raise RuntimeError(f"submit button stayed disabled before click for {flow_label}. {reason}.")
+
+    async def _click_submit_fallback(self, page: Page) -> bool:
+        return bool(
+            await page.evaluate(
+                r"""
+                () => {
+                  const selectors = 'button, [role="button"], [tabindex], div, span';
+                  const elements = Array.from(document.querySelectorAll(selectors));
+                  const isVisible = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                      rect.width >= 28 &&
+                      rect.height >= 28 &&
+                      rect.width <= 96 &&
+                      rect.height <= 96 &&
+                      rect.bottom > window.innerHeight - 120 &&
+                      rect.right > window.innerWidth - 220 &&
+                      rect.bottom <= window.innerHeight + 2 &&
+                      rect.right <= window.innerWidth + 2 &&
+                      style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      Number(style.opacity || "1") > 0.05
+                    );
+                  };
+                  const scoreElement = (el) => {
+                    if (!(el instanceof HTMLElement) || !isVisible(el)) return -1;
+                    if (el.closest("aside")) return -1;
+                    const rect = el.getBoundingClientRect();
+                    const text = [
+                      el.innerText || "",
+                      el.getAttribute("aria-label") || "",
+                      el.getAttribute("title") || "",
+                    ].join(" ").toLowerCase();
+                    const disabled =
+                      (el instanceof HTMLButtonElement && el.disabled) ||
+                      el.getAttribute("aria-disabled") === "true";
+                    let score = 0;
+                    if (disabled) score -= 500;
+                    if (el.querySelector("svg")) score += 180;
+                    if (text.includes("submit") || text.includes("send") || text.includes("generate")) score += 220;
+                    if (!text.trim()) score += 80;
+                    if (rect.right >= window.innerWidth - 80) score += 180;
+                    if (rect.bottom >= window.innerHeight - 80) score += 180;
+                    if (rect.width >= 40 && rect.height >= 40) score += 80;
+                    const radius = window.getComputedStyle(el).borderRadius || "";
+                    if (radius.includes("999") || radius.includes("50%")) score += 80;
+                    return score;
+                  };
+                  let best = null;
+                  let bestScore = -1;
+                  for (const el of elements) {
+                    const score = scoreElement(el);
+                    if (score > bestScore) {
+                      best = el;
+                      bestScore = score;
+                    }
+                  }
+                  if (!best || bestScore < 260) {
+                    return false;
+                  }
+                  best.click();
+                  return true;
+                }
+                """
+            )
+        )
+
+    async def _apply_generation_options(
+        self,
+        page: Page,
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+        duration: int | str | None = None,
+    ) -> dict:
+        applied: dict[str, str | int] = {}
+        requested: dict[str, str | int] = {}
+
+        if ratio:
+            requested["ratio"] = str(ratio).strip()
+        if quality:
+            requested["quality"] = str(quality).strip()
+        if duration is not None and str(duration).strip():
+            requested["duration"] = str(duration).strip()
+
+        if ratio:
+            ratio_value = str(ratio).strip()
+            ratio_candidates = [ratio_value]
+            ratio_aliases = {
+                "1:1": ["1x1", "square"],
+                "9:16": ["9x16", "portrait", "vertical"],
+                "16:9": ["16x9", "landscape", "horizontal"],
+                "3:4": ["3x4", "portrait"],
+                "4:3": ["4x3", "classic"],
+                "2:3": ["2x3", "portrait"],
+                "3:2": ["3x2", "landscape"],
+            }
+            ratio_candidates.extend(ratio_aliases.get(ratio_value, []))
+            if await self._try_click_matching_option(page, ratio_candidates):
+                applied["ratio"] = ratio_value
+            elif await self._try_open_dropdown(page, ["Aspect ratio", "Ratio"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, ratio_candidates):
+                    applied["ratio"] = ratio_value
+
+        if quality:
+            quality_value = str(quality).strip()
+            quality_candidates = [quality_value, quality_value.title(), quality_value.upper()]
+            if await self._try_click_matching_option(page, quality_candidates):
+                applied["quality"] = quality_value
+            elif await self._try_open_dropdown(page, ["Quality"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, quality_candidates):
+                    applied["quality"] = quality_value
+
+        if duration is not None and str(duration).strip():
+            duration_value = str(duration).strip()
+            duration_candidates = [
+                duration_value,
+                f"{duration_value}s",
+                f"{duration_value} sec",
+                f"{duration_value} seconds",
+            ]
+            if await self._try_click_matching_option(page, duration_candidates):
+                applied["duration"] = duration_value
+            elif await self._try_open_dropdown(page, ["Duration", "Length"]):
+                await page.wait_for_timeout(400)
+                if await self._try_click_matching_option(page, duration_candidates):
+                    applied["duration"] = duration_value
+
+        unapplied = {
+            key: value for key, value in requested.items() if str(applied.get(key, "")).strip() != str(value).strip()
+        }
+        return {
+            "requested": requested,
+            "applied": applied,
+            "unapplied": unapplied,
+        }
+
+    async def _select_video_submode(self, page: Page, video_mode: str) -> None:
+        target_label = "Image to video" if video_mode == "image_to_video" else "Text to video"
+        other_label = "Text to video" if video_mode == "image_to_video" else "Image to video"
+        selectors = [
+            f"[aria-label='Video mode'] button[role='radio']:has-text('{target_label}')",
+            f"[aria-label='Video mode'] >> text={target_label}",
+            f"button[role='radio']:has-text('{target_label}')",
+            f"[role='tab']:has-text('{target_label}')",
+            f"button:has-text('{target_label}')",
+            f"text='{target_label}'",
+        ]
+
+        for _ in range(4):
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.count() == 0:
+                        continue
+                    with suppress(Exception):
+                        if await locator.get_attribute("aria-checked") == "true":
+                            return
+                    with suppress(Exception):
+                        if await locator.get_attribute("aria-selected") == "true":
+                            return
+                    await locator.click(timeout=2000)
+                    await page.wait_for_timeout(700)
+                    with suppress(Exception):
+                        if await locator.get_attribute("aria-checked") == "true":
+                            return
+                    with suppress(Exception):
+                        if await locator.get_attribute("aria-selected") == "true":
+                            return
+                    page_text = str(await page.text_content("body") or "").lower()
+                    if target_label.lower() in page_text and other_label.lower() in page_text:
+                        return
+                except Exception:  # noqa: BLE001
+                    continue
             with suppress(Exception):
                 await page.keyboard.press("Escape")
-            with suppress(Exception):
-                await page.mouse.click(10, 10)
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(500)
+
+        raise RuntimeError(f"Could not switch Grok video mode to '{target_label}'.")
 
     async def _wait_for_filtered_media(self, page: Page, target: str, attempts: int = 18, delay_ms: int = 4000) -> list[str]:
         latest: list[str] = []
@@ -248,6 +714,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         stable_ready_hits = 0
         required_stable_hits = 3 if target == "image" else 1
         for _ in range(attempts):
+            blocked_message = await self._detect_content_policy_block(page, target)
+            if blocked_message:
+                raise ContentPolicyBlockedError(blocked_message)
             latest = self._normalize_media_urls(await self._extract_media_urls(page, target), target)
             if latest:
                 signature = tuple((len(item), item[:96]) for item in latest)
@@ -333,10 +802,14 @@ class GrokAutomationProvider(BaseAutomationProvider):
         page: Page,
         prompt: str,
         source_asset_path: str | None,
-        aspect_ratio: str | None = None,
-    ) -> None:
+        video_mode: str,
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+        duration: int | str | None = None,
+    ) -> dict:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
-        video_mode = await self._wait_for_action_button(
+        video_mode_button = await self._wait_for_action_button(
             page,
             [
                 "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
@@ -345,8 +818,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
             attempts=12,
             delay_ms=2000,
         )
-        if await video_mode.get_attribute("aria-checked") != "true":
-            await video_mode.click()
+        if await video_mode_button.get_attribute("aria-checked") != "true":
+            await video_mode_button.click()
+        await page.wait_for_timeout(800)
+        with suppress(Exception):
+            await self._select_video_submode(page, video_mode)
 
         if source_asset_path:
             source_file = Path(source_asset_path)
@@ -356,36 +832,76 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2000)
 
-        await self._set_aspect_ratio(page, aspect_ratio)
+        option_state = await self._apply_generation_options(
+            page,
+            ratio=ratio,
+            quality=quality,
+            duration=duration,
+        )
 
         if prompt.strip():
-            await self._dismiss_quality_popup(page)
             await self._fill_prompt(
                 page,
                 [
                     "[contenteditable='true']",
                     "div[contenteditable='true']",
+                    "[contenteditable='true'][data-placeholder*='Type' i]",
+                    "div[contenteditable='true'][data-placeholder*='Type' i]",
+                    "[role='textbox']",
+                    "div[role='textbox']",
+                    "[aria-label*='Type' i]",
+                    "textarea[placeholder*='imagine' i]",
+                    "input[placeholder*='imagine' i]",
                     "textarea",
+                    "textarea[placeholder*='Type' i]",
+                    "input[placeholder*='Type' i]",
                 ],
                 prompt,
             )
 
-        submit = await self._first_visible(
-            page,
-            [
-                "button[aria-label='Submit']",
-                "button[type='submit']",
-            ],
-        )
-        await submit.click()
+        try:
+            submit = await self._find_submit_button(page)
+        except RuntimeError as exc:
+            page_url = page.url
+            body_preview = await self._body_preview(page)
+            raise SubmitButtonDisabledError(
+                f"Grok did not render a detectable submit button for {video_mode.replace('_', '-')}. "
+                f"page_url={page_url}. body_preview={body_preview[:300]}"
+            ) from exc
+        try:
+            submit = await self._wait_for_enabled_submit_button(
+                page,
+                video_mode.replace("_", "-"),
+                attempts=30 if video_mode == "image_to_video" else 15,
+                delay_ms=1000,
+            )
+        except RuntimeError as exc:
+            if video_mode == "image_to_video" and await self._click_submit_fallback(page):
+                await page.wait_for_timeout(1500)
+                blocked_message = await self._detect_content_policy_block(page, "video")
+                if blocked_message:
+                    raise ContentPolicyBlockedError(blocked_message) from exc
+                return option_state
+            reason = await self._read_submit_disabled_reason(page)
+            raise SubmitButtonDisabledError(
+                f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
+            ) from exc
+        await submit.click(timeout=3000)
+        await page.wait_for_timeout(1500)
+        blocked_message = await self._detect_content_policy_block(page, "video")
+        if blocked_message:
+            raise ContentPolicyBlockedError(blocked_message)
+        return option_state
 
     async def _open_imagine_image_flow(
         self,
         page: Page,
         prompt: str,
         source_asset_path: str | None = None,
-        aspect_ratio: str | None = None,
-    ) -> None:
+        *,
+        ratio: str | None = None,
+        quality: str | None = None,
+    ) -> dict:
         await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
         with suppress(Exception):
             image_mode = await self._wait_for_action_button(
@@ -408,32 +924,41 @@ class GrokAutomationProvider(BaseAutomationProvider):
             await upload_input.set_input_files(str(source_file))
             await page.wait_for_timeout(2500)
 
-        await self._set_aspect_ratio(page, aspect_ratio)
+        option_state = await self._apply_generation_options(
+            page,
+            ratio=ratio,
+            quality=quality,
+        )
 
         if prompt.strip():
-            await self._dismiss_quality_popup(page)
             await self._fill_prompt(
                 page,
                 [
                     "[contenteditable='true']",
                     "div[contenteditable='true']",
                     "p[data-placeholder='Ask Grok']",
+                    "[contenteditable='true'][data-placeholder*='Type' i]",
+                    "div[contenteditable='true'][data-placeholder*='Type' i]",
+                    "[role='textbox']",
+                    "div[role='textbox']",
+                    "[aria-label*='Type' i]",
+                    "textarea[placeholder*='imagine' i]",
+                    "input[placeholder*='imagine' i]",
                     "textarea",
                     "textarea[placeholder*='Ask']",
+                    "textarea[placeholder*='Type' i]",
+                    "input[placeholder*='Type' i]",
                 ],
                 prompt,
             )
 
-        submit_locator = await self._first_visible(
-            page,
-            [
-                "button[aria-label='Submit']",
-                "button[type='submit']",
-                "button:has-text('Create image')",
-                "button:has-text('Generate')",
-            ],
-        )
-        await submit_locator.click()
+        submit_locator = await self._wait_for_enabled_submit_button(page, "image")
+        await submit_locator.click(timeout=3000)
+        await page.wait_for_timeout(1500)
+        blocked_message = await self._detect_content_policy_block(page, "image")
+        if blocked_message:
+            raise ContentPolicyBlockedError(blocked_message)
+        return option_state
 
     async def _download_file(self, page: Page, profile: Profile, job: AutomationJob, suffix_label: str) -> list[str]:
         download_button = await self._wait_for_action_button(
@@ -444,6 +969,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             ],
             attempts=24,
             delay_ms=5000,
+            policy_target=suffix_label,
         )
 
         output_dir = profile_storage.output_dir(profile.id)
@@ -453,24 +979,44 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     await download_button.click()
                 download = await download_info.value
             except Exception:  # noqa: BLE001
+                blocked_message = await self._detect_content_policy_block(page, suffix_label)
+                if blocked_message:
+                    raise ContentPolicyBlockedError(blocked_message)
                 await page.wait_for_timeout(5000)
                 continue
 
             suggested = download.suggested_filename
             suffix = Path(suggested).suffix.lower()
+            if suffix_label == "video" and suffix not in {".mp4", ".webm", ".mov"}:
+                with suppress(Exception):
+                    await download.cancel()
+                await page.wait_for_timeout(3000)
+                continue
             target_path = output_dir / f"{job.id}-{suffix_label}-{attempt + 1}{suffix or '.bin'}"
             await download.save_as(str(target_path))
+            try:
+                if target_path.exists() and target_path.stat().st_size < 1024:
+                    continue
+            except Exception:
+                pass
             return [str(target_path)]
         return []
 
     async def _download_video_asset(self, page: Page, profile: Profile, job: AutomationJob) -> list[str]:
-        make_video_button = await self._wait_for_action_button(
-            page,
-            [
-                "button[aria-label='Make video']",
-                "button:has-text('Make video')",
-            ],
-        )
+        try:
+            make_video_button = await self._wait_for_action_button(
+                page,
+                [
+                    "button[aria-label='Make video']",
+                    "button:has-text('Make video')",
+                ],
+                policy_target="video",
+            )
+        except RuntimeError as exc:
+            hidden_message = await self._detect_hidden_media_block(page, "video")
+            if hidden_message:
+                raise ContentPolicyBlockedError(hidden_message) from exc
+            raise
         await make_video_button.click()
 
         try:
@@ -529,7 +1075,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             "state": state,
             "indicators": indicators,
             "summary": summary,
-            "requires_live_browser": True,
+            "requires_live_browser": settings.reuse_live_browser_for_jobs,
         }
 
     async def perform(
@@ -542,34 +1088,81 @@ class GrokAutomationProvider(BaseAutomationProvider):
         del automation_settings
         provider_payload = job.provider_payload or {}
         source_asset_path = provider_payload.get("source_asset_path")
-        aspect_ratio = provider_payload.get("aspect_ratio") or provider_payload.get("ratio")
+        if source_asset_path and isinstance(source_asset_path, str) and source_asset_path.startswith("http"):
+            source_asset_path = _download_reference_image(source_asset_path, profile.id)
+        ratio = provider_payload.get("ratio") or provider_payload.get("aspect_ratio")
+        quality = provider_payload.get("quality")
+        duration = provider_payload.get("duration")
 
         if job.target.value == "video":
             video_mode = str(provider_payload.get("video_mode") or "text_to_video")
             if video_mode in {"text_to_video", "image_to_video"}:
-                await self._open_imagine_video_flow(
+                option_state = await self._open_imagine_video_flow(
                     page,
                     job.prompt,
                     source_asset_path if video_mode == "image_to_video" else None,
-                    aspect_ratio,
+                    video_mode,
+                    ratio=str(ratio) if ratio else None,
+                    quality=str(quality) if quality else None,
+                    duration=duration,
                 )
-                media_urls = await self._download_file(page, profile, job, "video")
-                if not media_urls and source_asset_path is None:
+                media_urls: list[str] = []
+                if video_mode == "image_to_video":
                     media_urls = await self._download_video_asset(page, profile, job)
+                if not media_urls:
+                    media_urls = await self._download_file(page, profile, job, "video")
+                if not media_urls:
+                    media_urls = await self._wait_for_media(page, "video")
+                    if media_urls:
+                        output_dir = profile_storage.output_dir(profile.id)
+                        localized: list[str] = []
+                        for index, url in enumerate(media_urls, start=1):
+                            target_path = output_dir / f"{job.id}-video-{index}.mp4"
+                            if url.startswith("data:"):
+                                localized.append(await self._save_data_url(url, target_path))
+                            else:
+                                localized.append(await self._download_remote_media(page, url, target_path))
+                        media_urls = localized
+                media_urls = self._normalize_media_urls(media_urls, "video")
+                if not media_urls:
+                    if video_mode == "image_to_video":
+                        raise InvalidVideoOutputError(
+                            "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
+                        )
+                    raise InvalidVideoOutputError(
+                        "Grok did not return a real video file for this video job."
+                    )
                 return {
                     "target": job.target.value,
                     "video_mode": video_mode,
                     "source_asset_path": source_asset_path,
+                    "ratio": ratio,
+                    "quality": quality,
+                    "duration": duration,
+                    "requested_options": option_state.get("requested", {}),
+                    "applied_options": option_state.get("applied", {}),
+                    "unapplied_options": option_state.get("unapplied", {}),
                     "media_urls": media_urls,
                 }
 
-        await self._open_imagine_image_flow(page, job.prompt, source_asset_path, aspect_ratio)
+        option_state = await self._open_imagine_image_flow(
+            page,
+            job.prompt,
+            source_asset_path,
+            ratio=str(ratio) if ratio else None,
+            quality=str(quality) if quality else None,
+        )
 
         media_urls = await self._wait_for_filtered_media(page, job.target.value)
         media_urls = await self._localize_image_media(page, profile, job, media_urls)
         return {
             "target": job.target.value,
             "source_asset_path": source_asset_path,
+            "ratio": ratio,
+            "quality": quality,
+            "requested_options": option_state.get("requested", {}),
+            "applied_options": option_state.get("applied", {}),
+            "unapplied_options": option_state.get("unapplied", {}),
             "media_urls": media_urls,
         }
 

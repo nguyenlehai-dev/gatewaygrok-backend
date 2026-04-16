@@ -91,24 +91,100 @@ Tat ca endpoints ben duoi, tru `/health`, `/auth/*`, `/client/*`, deu can:
 - `POST /jobs`
 - `POST /jobs/{job_id}/retry`
 
-`POST /jobs` va `POST /client/jobs` se tra `409` neu profile session chua san sang cho automation.
+`POST /jobs` va `POST /client/jobs` se tra `409` neu profile session chua san sang cho automation (hoac khong co profile nao san sang trong pool).
 
 ## Client Jobs with API key
 
 Header: `x-api-key: <plain_key>`
 
-- `POST /client/jobs`
+- `POST /client/generate`
+- `GET /client/tasks/{task_id}`
+- `GET /client/tasks/{task_id}/status` (lite)
+- `GET /client/jobs/{task_id}` (legacy poll alias)
+- `GET /client/jobs/{task_id}/status` (legacy lite alias)
+- `POST /client/jobs` (legacy create alias)
 
 ```json
 {
-  "profile_id": "uuid",
-  "target": "image",
+  "profile_id": "uuid (optional)",
+  "target": "video",
   "prompt": "a cinematic robot in Bangkok",
+  "reference_images": [
+    "https://images.example.com/ref.png"
+  ],
+  "ratio": "16:9",
+  "quality": "high",
+  "duration": 5,
   "negative_prompt": "",
   "count": 1,
   "provider_payload": {}
 }
 ```
+
+### Mapping rules
+
+- `target=image` and no `reference_images`: image generation flow.
+- `target=image` and `reference_images` present: image flow with `source_asset_path` mapped from the first reference.
+- `target=video` and no `reference_images`: `video_mode=text_to_video`.
+- `target=video` and `reference_images` present: `video_mode=image_to_video`.
+- `ratio`, `quality`, and `duration` are accepted at top level and forwarded into `provider_payload`.
+- `profile_id` is optional. If omitted, backend auto-selects an active profile that is authenticated and allowed by the API key.
+- `reference_images` can be storage paths or `http/https` URLs (backend will download URLs into profile assets).
+
+### Generate response (compact)
+
+```json
+{
+  "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "status": "pending",
+  "success": false,
+  "message": "pending",
+  "url": null
+}
+```
+
+### Poll response (full)
+
+```json
+{
+  "id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "status": "running",
+  "profile_id": "uuid",
+  "target": "video",
+  "result_payload": {
+    "media_urls": [
+      "https://flowgrok.plxeditor.com/storage/profiles/uuid/output/42d72140-8613-4a53-a1df-1af4db95f4df-video-1.mp4"
+    ]
+  },
+  "error_message": null
+}
+```
+
+### Lite status response (recommended)
+
+```json
+{
+  "task_id": "42d72140-8613-4a53-a1df-1af4db95f4df",
+  "status": "running",
+  "success": false,
+  "message": "running",
+  "url": null
+}
+```
+
+### Status and errors
+
+- `pending`: task has been accepted and queued.
+- `running`: worker is currently automating the live Grok session.
+- `succeeded`: `result_payload.media_urls` is available.
+- `failed`: task stopped and `error_message` contains the reason.
+
+Common error cases:
+
+- `401`: missing or invalid `x-api-key`
+- `403`: API key is not allowed to use the selected profile category
+- `404`: profile or task not found
+- `409`: profile session is not ready for automation, or no available profile in pool
 
 ## FE pages cần có
 
