@@ -2043,6 +2043,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         except asyncio.TimeoutError:
                             self._log_job_step(job, "direct_video_download_timeout")
                             media_urls = []
+                        except Exception as exc:  # noqa: BLE001
+                            self._log_job_step(job, f"direct_video_download_unavailable reason={type(exc).__name__}")
+                            media_urls = []
                     if not media_urls:
                         self._log_job_step(job, "wait_video_media_start")
                         media_urls = await asyncio.wait_for(
