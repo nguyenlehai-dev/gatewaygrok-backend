@@ -1985,6 +1985,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
         elapsed = 0
         download_without_video_hits = 0
         hidden_notice_logged = False
+        hidden_stall_ms = 0
+        stable_progress_ms = 0
+        last_progress_key: str | None = None
         while elapsed < timeout_ms:
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
@@ -1996,6 +1999,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     self._log_job_step(job, "video_hidden_signal_observed")
                     self._note_soft_provider_block(job, "video", hidden_message)
                     hidden_notice_logged = True
+                hidden_stall_ms += poll_ms
+            else:
+                hidden_stall_ms = 0
 
             media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
             if not media_urls:
@@ -2011,6 +2017,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     self._mark_video_result_detected(job, submitted_post_url)
                     self._log_job_step(job, "video_ready_download_visible")
                     return []
+                progress_key = str(state.get("progress") or "")
+                if progress_key and progress_key == last_progress_key:
+                    stable_progress_ms += poll_ms
+                else:
+                    stable_progress_ms = 0
+                    last_progress_key = progress_key
                 if state.get("generating"):
                     progress = state.get("progress")
                     self._log_job_step(job, f"video_generation_in_progress progress={progress or 'unknown'}")
@@ -2024,6 +2036,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if state.get("hasDownload"):
                     download_without_video_hits += 1
                     self._log_job_step(job, "video_download_visible_without_video")
+                    if hidden_stall_ms >= 90000 or (stable_progress_ms >= 120000 and progress_key):
+                        self._log_job_step(
+                            job,
+                            f"video_ready_soft_stall hidden_ms={hidden_stall_ms} stable_progress_ms={stable_progress_ms}",
+                        )
+                        self._update_job_runtime_payload(
+                            job,
+                            message="Grok progress looks stalled; trying direct video download now...",
+                            stage="downloading",
+                        )
+                        return []
                     if not state.get("generating"):
                         self._update_job_runtime_payload(
                             job,
@@ -2422,7 +2445,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         media_urls = await self._wait_for_video_ready(
             page,
             job,
-            timeout_ms=480000,
+            timeout_ms=240000,
             baseline_urls=baseline_urls,
             submitted_post_url=submitted_post_url,
         )
@@ -2633,7 +2656,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         try:
                             media_urls = await asyncio.wait_for(
                                 self._download_video_asset(page, profile, job, submitted_post_url),
-                                timeout=600,
+                                timeout=300,
                             )
                         except Exception as exc:  # noqa: BLE001
                             self._log_job_step(job, f"make_video_fallback_unavailable reason={type(exc).__name__}")
@@ -2678,7 +2701,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         try:
                             media_urls = await asyncio.wait_for(
                                 self._download_file(page, profile, job, "video", submitted_post_url=submitted_post_url),
-                                timeout=180,
+                                timeout=120,
                             )
                         except asyncio.TimeoutError:
                             self._log_job_step(job, "direct_video_download_timeout")
@@ -2697,7 +2720,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         try:
                             media_urls = await asyncio.wait_for(
                                 self._download_video_asset(page, profile, job, submitted_post_url),
-                                timeout=600,
+                                timeout=300,
                             )
                         except Exception as exc:  # noqa: BLE001
                             self._log_job_step(job, f"make_video_fallback_unavailable reason={type(exc).__name__}")
