@@ -37,6 +37,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
     provider_name = "grok"
     start_url = "https://grok.com/"
 
+    def _soften_provider_block_for_target(self, target: str | None) -> bool:
+        return str(target or "").strip().lower() == "video"
+
     def _log_job_step(self, job: AutomationJob, step: str) -> None:
         print(
             f"grok_job_step job_id={job.id} profile_id={job.profile_id} target={job.target.value} step={step}",
@@ -103,6 +106,25 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "video_ready_detected": True,
                 "submitted_post_url": self._extract_post_url(submitted_post_url),
             },
+        )
+
+    def _note_soft_provider_block(self, job: AutomationJob, target: str, provider_notice: str, *, stage: str = "provider-block-observed") -> None:
+        runtime = self._read_job_runtime_payload(job)
+        extra = {
+            "soft_provider_block": True,
+            "soft_provider_block_target": target,
+        }
+        if runtime.get("video_ready_detected"):
+            extra["video_ready_detected"] = True
+        self._update_job_runtime_payload(
+            job,
+            message=(
+                f"Grok reported a temporary restriction for {target}, but FlowGrok is still waiting for the real video result..."
+            ),
+            stage=stage,
+            blocked=False,
+            notice=provider_notice,
+            extra=extra,
         )
 
     def _hidden_result_exception(self, job: AutomationJob, target: str, hidden_message: str) -> RuntimeError:
@@ -984,10 +1006,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
             if policy_target:
                 blocked_message = await self._detect_content_policy_block(page, policy_target)
                 if blocked_message:
-                    raise ContentPolicyBlockedError(blocked_message)
+                    if not self._soften_provider_block_for_target(policy_target):
+                        raise ContentPolicyBlockedError(blocked_message)
                 hidden_message = await self._detect_hidden_media_block(page, policy_target)
                 if hidden_message:
-                    raise ContentPolicyBlockedError(hidden_message)
+                    if not self._soften_provider_block_for_target(policy_target):
+                        raise ContentPolicyBlockedError(hidden_message)
             await page.wait_for_timeout(delay_ms)
         raise RuntimeError(f"No matching selector found: {selectors}")
 
@@ -1869,13 +1893,18 @@ class GrokAutomationProvider(BaseAutomationProvider):
     ) -> list[str]:
         elapsed = 0
         download_without_video_hits = 0
+        hidden_notice_logged = False
         while elapsed < timeout_ms:
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
-                raise ContentPolicyBlockedError(blocked_message)
+                self._log_job_step(job, "video_policy_signal_observed")
+                self._note_soft_provider_block(job, "video", blocked_message)
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
-                raise self._hidden_result_exception(job, "video", hidden_message)
+                if not hidden_notice_logged:
+                    self._log_job_step(job, "video_hidden_signal_observed")
+                    self._note_soft_provider_block(job, "video", hidden_message)
+                    hidden_notice_logged = True
 
             media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
             if not media_urls:
@@ -2223,10 +2252,18 @@ class GrokAutomationProvider(BaseAutomationProvider):
             except Exception:  # noqa: BLE001
                 blocked_message = await self._detect_content_policy_block(page, suffix_label)
                 if blocked_message:
-                    raise ContentPolicyBlockedError(blocked_message)
+                    if self._soften_provider_block_for_target(suffix_label):
+                        self._log_job_step(job, f"{suffix_label}_policy_signal_while_downloading")
+                        self._note_soft_provider_block(job, suffix_label, blocked_message, stage="downloading")
+                    else:
+                        raise ContentPolicyBlockedError(blocked_message)
                 hidden_message = await self._detect_hidden_media_block(page, suffix_label)
                 if hidden_message:
-                    raise self._hidden_result_exception(job, suffix_label, hidden_message)
+                    if self._soften_provider_block_for_target(suffix_label):
+                        self._log_job_step(job, f"{suffix_label}_hidden_signal_while_downloading")
+                        self._note_soft_provider_block(job, suffix_label, hidden_message, stage="downloading")
+                    else:
+                        raise self._hidden_result_exception(job, suffix_label, hidden_message)
                 runtime = self._read_job_runtime_payload(job)
                 if runtime.get("video_ready_detected") and await self._page_lost_result_context(page, submitted_post_url):
                     raise self._vanished_result_exception(job, suffix_label, page_url=page.url)
@@ -2273,7 +2310,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
         except RuntimeError as exc:
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
-                raise self._hidden_result_exception(job, "video", hidden_message) from exc
+                self._log_job_step(job, "make_video_hidden_signal_observed")
+                self._note_soft_provider_block(job, "video", hidden_message, stage="make-video")
             raise
         await make_video_button.click()
         self._log_job_step(job, "make_video_clicked")
@@ -2605,7 +2643,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     if not media_urls:
                         hidden_message = await self._detect_hidden_media_block(page, "video")
                         if hidden_message:
-                            raise self._hidden_result_exception(job, "video", hidden_message)
+                            self._log_job_step(job, "video_hidden_signal_final")
+                            self._note_soft_provider_block(job, "video", hidden_message)
                         runtime = self._read_job_runtime_payload(job)
                         if runtime.get("video_ready_detected") and await self._page_lost_result_context(page, submitted_post_url):
                             raise self._vanished_result_exception(job, "video", page_url=page.url)
