@@ -964,6 +964,45 @@ class GrokAutomationProvider(BaseAutomationProvider):
             )
         )
 
+    async def _clear_blocking_dialogs(self, page: Page) -> None:
+        with suppress(Exception):
+            await page.keyboard.press("Escape")
+        with suppress(Exception):
+            await page.evaluate(
+                r"""
+                () => {
+                  const selectors = [
+                    "[data-state='open'][aria-hidden='true']",
+                    "[data-state='open'][data-aria-hidden='true']",
+                    "[role='dialog'] [aria-label='Close']",
+                    "[role='dialog'] button[aria-label='Close']",
+                  ];
+                  for (const selector of selectors) {
+                    for (const node of Array.from(document.querySelectorAll(selector))) {
+                      if (!(node instanceof HTMLElement)) continue;
+                      if (node.getAttribute("role") === "dialog") continue;
+                      node.click?.();
+                    }
+                  }
+                }
+                """
+            )
+        await page.wait_for_timeout(300)
+
+    async def _click_submit_button(self, page: Page, submit, *, flow_label: str) -> None:
+        try:
+            await submit.click(timeout=3000)
+            return
+        except Exception:
+            await self._clear_blocking_dialogs(page)
+        with suppress(Exception):
+            await submit.click(timeout=2000, force=True)
+            return
+        if await self._click_submit_fallback(page):
+            await page.wait_for_timeout(1200)
+            return
+        raise RuntimeError(f"Submit click failed for {flow_label}.")
+
     async def _apply_generation_options(
         self,
         page: Page,
@@ -1434,7 +1473,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     raise SubmitButtonDisabledError(
                         f"Grok did not enable the submit button for {video_mode.replace('_', '-')}. {reason}."
                     ) from exc
-                await submit.click(timeout=3000)
+                await self._click_submit_button(page, submit, flow_label=video_mode.replace("_", "-"))
                 await page.wait_for_timeout(1500)
                 blocked_message = await self._detect_content_policy_block(page, "video")
                 if blocked_message:
@@ -1491,7 +1530,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
         await self._fill_grok_prompt(page, prompt, edit_mode=bool(source_asset_path))
 
         submit_locator = await self._wait_for_enabled_submit_button(page, "image")
-        await submit_locator.click(timeout=3000)
+        await self._click_submit_button(page, submit_locator, flow_label="image")
         await page.wait_for_timeout(1500)
         blocked_message = await self._detect_content_policy_block(page, "image")
         if blocked_message:
@@ -1585,7 +1624,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
             attempts=20,
             delay_ms=1000,
         )
-        await submit.click(timeout=3000)
+        await self._click_submit_button(page, submit, flow_label="image-to-video-second-pass")
         await page.wait_for_timeout(1500)
 
         self._log_job_step(job, "image_result_to_video_submitted")
