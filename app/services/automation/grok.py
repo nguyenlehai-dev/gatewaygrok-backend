@@ -121,6 +121,28 @@ class GrokAutomationProvider(BaseAutomationProvider):
             return local_or_data_urls
         return []
 
+    def _reject_unscoped_image_to_video_urls(
+        self,
+        media_urls: list[str],
+        submitted_post_url: str | None,
+    ) -> list[str]:
+        """Image-to-video pages often keep old history videos in the DOM.
+
+        For this flow, remote URLs are only safe when they can be tied to the
+        submitted post. Otherwise we use them as a readiness signal only and
+        download from the current post UI instead.
+        """
+        scoped_urls = self._filter_video_urls_for_submitted_post(media_urls, submitted_post_url)
+        if scoped_urls:
+            return scoped_urls
+
+        local_or_data_urls = [
+            str(url).strip()
+            for url in media_urls
+            if str(url).strip() and not str(url).strip().startswith(("http://", "https://"))
+        ]
+        return local_or_data_urls
+
     def _begin_video_network_capture(self, page: Page) -> None:
         captured: list[str] = []
 
@@ -2081,7 +2103,8 @@ class GrokAutomationProvider(BaseAutomationProvider):
             baseline_urls=baseline_urls,
         )
         if media_urls:
-            return media_urls
+            downloaded = await self._download_file(page, profile, job, "video", attempts=6, delay_ms=1500)
+            return downloaded or media_urls
 
         return await self._download_file(page, profile, job, "video")
 
@@ -2257,6 +2280,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout_ms=480000 if video_mode == "image_to_video" else 300000,
                         baseline_urls=baseline_video_urls if isinstance(baseline_video_urls, list) else None,
                     )
+                    if video_mode == "image_to_video" and media_urls:
+                        scoped_media_urls = self._reject_unscoped_image_to_video_urls(media_urls, submitted_post_url)
+                        if scoped_media_urls:
+                            media_urls = scoped_media_urls
+                        else:
+                            self._log_job_step(job, "image_to_video_ignored_unscoped_ready_urls")
+                            media_urls = []
                     post_video_urls = await self._extract_submitted_post_video_urls(page, submitted_post_url)
                     if isinstance(baseline_video_urls, list):
                         post_video_urls = self._filter_new_media_urls(post_video_urls, baseline_video_urls)
@@ -2295,6 +2325,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                     network_video_urls = self._read_video_network_capture(page)
                     if isinstance(baseline_video_urls, list):
                         network_video_urls = self._filter_new_media_urls(network_video_urls, baseline_video_urls)
+                    if video_mode == "image_to_video" and network_video_urls:
+                        network_video_urls = self._reject_unscoped_image_to_video_urls(
+                            network_video_urls,
+                            submitted_post_url,
+                        )
                     if network_video_urls and not media_urls:
                         media_urls = network_video_urls
                     if not media_urls:
@@ -2315,7 +2350,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         except Exception as exc:  # noqa: BLE001
                             self._log_job_step(job, f"direct_video_download_unavailable reason={type(exc).__name__}")
                             media_urls = []
-                    if not media_urls:
+                    if not media_urls and video_mode != "image_to_video":
                         self._log_job_step(job, "wait_video_media_start")
                         media_urls = await asyncio.wait_for(
                             self._wait_for_media(page, "video"),
