@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import re
+import urllib.request
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1562,21 +1563,39 @@ class GrokAutomationProvider(BaseAutomationProvider):
         return []
 
     async def _download_remote_media(self, page: Page, url: str, target_path: Path) -> str:
-        payload = await page.evaluate(
-            """
-            async (assetUrl) => {
-                const response = await fetch(assetUrl, { credentials: "include" });
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-              }
-              const buffer = await response.arrayBuffer();
-              return Array.from(new Uint8Array(buffer));
-            }
-            """,
-            url,
-        )
+        data: bytes | None = None
+        with suppress(Exception):
+            payload = await page.evaluate(
+                """
+                async (assetUrl) => {
+                    const response = await fetch(assetUrl, { credentials: "include" });
+                  if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                  }
+                  const buffer = await response.arrayBuffer();
+                  return Array.from(new Uint8Array(buffer));
+                }
+                """,
+                url,
+            )
+            data = bytes(payload)
 
-        data = bytes(payload)
+        if data is None:
+            def _download_with_backend() -> bytes:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    return response.read()
+
+            data = await self._run_in_thread(_download_with_backend)
 
         def _write() -> str:
             target_path.write_bytes(data)
