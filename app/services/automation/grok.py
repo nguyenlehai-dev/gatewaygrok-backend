@@ -1011,9 +1011,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
             () => {
               const body = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
               const normalized = body.toLowerCase();
-              const hasDownload = Boolean(
-                document.querySelector("button[aria-label='Download'], button:has-text('Download')")
-              );
+              const hasDownload = Array.from(document.querySelectorAll("button"))
+                .some((button) => {
+                  const label = [
+                    button.getAttribute("aria-label") || "",
+                    button.innerText || "",
+                    button.getAttribute("title") || "",
+                  ].join(" ").toLowerCase();
+                  return label.includes("download");
+                });
               const hasVideo = Array.from(document.querySelectorAll("video")).some((video) => {
                 const src = video.currentSrc || video.src || "";
                 return Boolean(src);
