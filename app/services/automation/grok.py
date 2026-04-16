@@ -131,6 +131,24 @@ class GrokAutomationProvider(BaseAutomationProvider):
         )
         return ContentPolicyBlockedError(hidden_message)
 
+    def _vanished_result_exception(self, job: AutomationJob, target: str, *, page_url: str | None = None) -> RuntimeError:
+        runtime = self._read_job_runtime_payload(job)
+        transient_message = (
+            f"Grok briefly exposed a {target} result, but the page lost the result context before download completed. "
+            "Please retry this job."
+        )
+        self._update_job_runtime_payload(
+            job,
+            message=transient_message,
+            stage="vanished",
+            blocked=False,
+            extra={
+                "video_ready_detected": True,
+                "last_page_url": page_url,
+            },
+        )
+        return TransientVideoResultLostError(transient_message)
+
     def _extract_post_url(self, value: str | None) -> str | None:
         if not value:
             return None
@@ -869,6 +887,10 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 eyeSlashIcon,
                 hiddenMediaPanel,
                 bodyText,
+                headingText: Array.from(document.querySelectorAll("h1, h2, h3"))
+                  .map((node) => (node.textContent || "").trim().toLowerCase())
+                  .filter(Boolean)
+                  .slice(0, 10),
               };
             }
             """
@@ -876,7 +898,15 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if not isinstance(details, dict):
             return None
 
+        page_url = str(page.url or "")
         body_text = str(details.get("bodyText") or "")
+        heading_text = " ".join(str(item) for item in details.get("headingText") or [])
+        on_post_page = "/imagine/post/" in page_url
+        on_template_page = "featured templates" in heading_text or "discover" in heading_text
+
+        if not on_post_page and on_template_page:
+            return None
+
         blocked_phrases = [
             "sensitive",
             "not available",
@@ -898,7 +928,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 "This is likely a sensitive-content or policy restriction."
             )
 
-        if details.get("hiddenMediaPanel"):
+        if details.get("hiddenMediaPanel") and on_post_page:
             return (
                 f"Grok hid the generated {target} result behind a visibility gate. "
                 "This is likely a sensitive-content or policy restriction."
@@ -2541,6 +2571,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         hidden_message = await self._detect_hidden_media_block(page, "video")
                         if hidden_message:
                             raise self._hidden_result_exception(job, "video", hidden_message)
+                        runtime = self._read_job_runtime_payload(job)
+                        if runtime.get("video_ready_detected"):
+                            raise self._vanished_result_exception(job, "video", page_url=page.url)
                         if video_mode == "image_to_video":
                             raise InvalidVideoOutputError(
                                 "Grok did not return a real video file for this image-to-video job. It appears to have stayed in an image flow or only produced image output."
