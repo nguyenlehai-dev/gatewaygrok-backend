@@ -559,13 +559,9 @@ class GrokAutomationProvider(BaseAutomationProvider):
             "textarea",
         ]
 
-        if not edit_mode:
-            await self._fill_prompt(page, placeholder_selectors, prompt)
-            return
-
         filled = await page.evaluate(
             r"""
-            (prompt) => {
+            ({ prompt, editMode }) => {
               const isVisible = (el) => {
                 if (!(el instanceof HTMLElement)) return false;
                 const rect = el.getBoundingClientRect();
@@ -593,10 +589,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 const rect = el.getBoundingClientRect();
                 const text = textOf(el);
                 let value = 0;
-                if (text.includes("describe your edit")) value += 500;
-                if (text.includes("describe")) value += 260;
-                if (text.includes("edit")) value += 180;
-                if (text.includes("ask grok")) value += 120;
+                if (editMode && text.includes("describe your edit")) value += 500;
+                if (editMode && text.includes("describe")) value += 260;
+                if (editMode && text.includes("edit")) value += 180;
+                if (!editMode && text.includes("type to imagine")) value += 520;
+                if (!editMode && text.includes("imagine")) value += 300;
+                if (!editMode && text.includes("ask grok")) value += 220;
+                if (!editMode && text.includes("ask anything")) value += 180;
                 if (text.includes("type")) value += 80;
                 if (el.isContentEditable) value += 80;
                 if (el.getAttribute("role") === "textbox") value += 50;
@@ -623,7 +622,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
               return true;
             }
             """,
-            prompt,
+            {"prompt": prompt, "editMode": edit_mode},
         )
         if filled:
             await page.wait_for_timeout(300)
