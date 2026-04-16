@@ -187,6 +187,17 @@ class GrokAutomationProvider(BaseAutomationProvider):
             elapsed += 1000
         return self._extract_post_url(page.url)
 
+    async def _ensure_on_submitted_post(self, page: Page, submitted_post_url: str | None) -> None:
+        target_post_url = self._extract_post_url(submitted_post_url)
+        if not target_post_url:
+            return
+        current_post_url = self._extract_post_url(page.url)
+        if current_post_url == target_post_url:
+            return
+        with suppress(Exception):
+            await page.goto(target_post_url, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1200)
+
     def _coerce_image_to_video_prompt(self, prompt: str) -> str:
         normalized = " ".join((prompt or "").split()).strip()
         if not normalized:
@@ -2076,9 +2087,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
         *,
         attempts: int = 24,
         delay_ms: int = 5000,
+        submitted_post_url: str | None = None,
     ) -> list[str]:
         output_dir = profile_storage.output_dir(profile.id)
         for attempt in range(max(attempts, 8)):
+            await self._ensure_on_submitted_post(page, submitted_post_url)
             download_button = None
             try:
                 download_button = await self._wait_for_action_button(
@@ -2133,7 +2146,14 @@ class GrokAutomationProvider(BaseAutomationProvider):
             return [str(target_path)]
         return []
 
-    async def _download_video_asset(self, page: Page, profile: Profile, job: AutomationJob) -> list[str]:
+    async def _download_video_asset(
+        self,
+        page: Page,
+        profile: Profile,
+        job: AutomationJob,
+        submitted_post_url: str | None = None,
+    ) -> list[str]:
+        await self._ensure_on_submitted_post(page, submitted_post_url)
         baseline_urls = await self._extract_ready_video_urls(page)
         try:
             make_video_button = await self._wait_for_action_button(
@@ -2176,10 +2196,18 @@ class GrokAutomationProvider(BaseAutomationProvider):
             baseline_urls=baseline_urls,
         )
         if media_urls:
-            downloaded = await self._download_file(page, profile, job, "video", attempts=6, delay_ms=1500)
+            downloaded = await self._download_file(
+                page,
+                profile,
+                job,
+                "video",
+                attempts=6,
+                delay_ms=1500,
+                submitted_post_url=submitted_post_url,
+            )
             return downloaded or media_urls
 
-        return await self._download_file(page, profile, job, "video")
+        return await self._download_file(page, profile, job, "video", submitted_post_url=submitted_post_url)
 
     async def _promote_image_result_to_video(
         self,
@@ -2371,7 +2399,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         self._log_job_step(job, "make_video_fallback_start")
                         try:
                             media_urls = await asyncio.wait_for(
-                                self._download_video_asset(page, profile, job),
+                                self._download_video_asset(page, profile, job, submitted_post_url),
                                 timeout=600,
                             )
                         except Exception as exc:  # noqa: BLE001
@@ -2388,6 +2416,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                                     "video",
                                     attempts=6,
                                     delay_ms=1500,
+                                    submitted_post_url=submitted_post_url,
                                 ),
                                 timeout=90,
                             )
@@ -2414,7 +2443,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         self._log_job_step(job, "direct_video_download_start")
                         try:
                             media_urls = await asyncio.wait_for(
-                                self._download_file(page, profile, job, "video"),
+                                self._download_file(page, profile, job, "video", submitted_post_url=submitted_post_url),
                                 timeout=180,
                             )
                         except asyncio.TimeoutError:
@@ -2433,7 +2462,7 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         self._log_job_step(job, "make_video_fallback_start")
                         try:
                             media_urls = await asyncio.wait_for(
-                                self._download_video_asset(page, profile, job),
+                                self._download_video_asset(page, profile, job, submitted_post_url),
                                 timeout=600,
                             )
                         except Exception as exc:  # noqa: BLE001
