@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from playwright.async_api import Page
 
 from app.core.config import settings
+from app.db.session import SessionLocal
 from app.models.automation_job import AutomationJob
 from app.models.profile import Profile
 from app.schemas.setting import AutomationSettings
@@ -37,6 +38,44 @@ class GrokAutomationProvider(BaseAutomationProvider):
             f"grok_job_step job_id={job.id} profile_id={job.profile_id} target={job.target.value} step={step}",
             flush=True,
         )
+
+    def _update_job_runtime_payload(
+        self,
+        job: AutomationJob,
+        *,
+        progress_percent: int | None = None,
+        message: str | None = None,
+        stage: str | None = None,
+        blocked: bool | None = None,
+        notice: str | None = None,
+    ) -> None:
+        runtime: dict = {}
+        if progress_percent is not None:
+            runtime["progress_percent"] = max(0, min(100, int(progress_percent)))
+        if message:
+            runtime["progress_message"] = message
+        if stage:
+            runtime["stage"] = stage
+        if blocked is not None:
+            runtime["blocked"] = bool(blocked)
+        if notice:
+            runtime["provider_notice"] = notice
+
+        if not runtime:
+            return
+
+        with suppress(Exception):
+            with SessionLocal() as db:
+                db_job = db.get(AutomationJob, job.id)
+                if not db_job:
+                    return
+                payload = dict(db_job.result_payload or {})
+                existing_runtime = dict(payload.get("runtime") or {})
+                existing_runtime.update(runtime)
+                payload["runtime"] = existing_runtime
+                db_job.result_payload = payload
+                db.add(db_job)
+                db.commit()
 
     def _extract_post_url(self, value: str | None) -> str | None:
         if not value:
@@ -1612,9 +1651,23 @@ class GrokAutomationProvider(BaseAutomationProvider):
         while elapsed < timeout_ms:
             blocked_message = await self._detect_content_policy_block(page, "video")
             if blocked_message:
+                self._update_job_runtime_payload(
+                    job,
+                    blocked=True,
+                    notice=blocked_message,
+                    message=blocked_message,
+                    stage="blocked",
+                )
                 raise ContentPolicyBlockedError(blocked_message)
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
+                self._update_job_runtime_payload(
+                    job,
+                    blocked=True,
+                    notice=hidden_message,
+                    message=hidden_message,
+                    stage="hidden",
+                )
                 raise ContentPolicyBlockedError(hidden_message)
 
             media_urls = self._normalize_media_urls(await self._extract_media_urls(page, "video"), "video")
@@ -1633,6 +1686,11 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if state.get("hasDownload"):
                     download_without_video_hits += 1
                     self._log_job_step(job, "video_download_visible_without_video")
+                    self._update_job_runtime_payload(
+                        job,
+                        message="Grok returned an image result first. Preparing video conversion...",
+                        stage="image-result",
+                    )
                     if download_without_video_hits >= 4:
                         self._log_job_step(job, "video_image_result_detected")
                         return []
@@ -1641,6 +1699,13 @@ class GrokAutomationProvider(BaseAutomationProvider):
                 if state.get("generating"):
                     progress = state.get("progress") or "unknown"
                     self._log_job_step(job, f"video_generation_in_progress progress={progress}")
+                    if str(progress).isdigit():
+                        self._update_job_runtime_payload(
+                            job,
+                            progress_percent=int(progress),
+                            message=f"Generating {progress}%",
+                            stage="generating",
+                        )
 
             await page.wait_for_timeout(poll_ms)
             elapsed += poll_ms
@@ -1987,10 +2052,22 @@ class GrokAutomationProvider(BaseAutomationProvider):
         except RuntimeError as exc:
             hidden_message = await self._detect_hidden_media_block(page, "video")
             if hidden_message:
+                self._update_job_runtime_payload(
+                    job,
+                    blocked=True,
+                    notice=hidden_message,
+                    message=hidden_message,
+                    stage="hidden",
+                )
                 raise ContentPolicyBlockedError(hidden_message) from exc
             raise
         await make_video_button.click()
         self._log_job_step(job, "make_video_clicked")
+        self._update_job_runtime_payload(
+            job,
+            message="Grok image result detected. Make video clicked; waiting for video progress...",
+            stage="make-video",
+        )
 
         try:
             await page.wait_for_url("**/imagine/post/**", timeout=90000)
@@ -2161,6 +2238,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
                         timeout=180 if video_mode == "image_to_video" else 150,
                     )
                     self._log_job_step(job, f"video_flow_submitted mode={video_mode}")
+                    self._update_job_runtime_payload(
+                        job,
+                        progress_percent=0,
+                        message="Submitted to Grok. Waiting for generation progress...",
+                        stage="submitted",
+                    )
                     submitted_post_url = option_state.get("submitted_post_url") if isinstance(option_state, dict) else None
                     baseline_video_urls = option_state.get("baseline_video_urls") if isinstance(option_state, dict) else None
                     if isinstance(submitted_post_url, str) and submitted_post_url:
@@ -2270,6 +2353,12 @@ class GrokAutomationProvider(BaseAutomationProvider):
                             media_urls = localized
                     media_urls = self._normalize_media_urls(media_urls, "video")
                     if media_urls:
+                        self._update_job_runtime_payload(
+                            job,
+                            progress_percent=100,
+                            message="Video ready. Downloading artifact to local storage...",
+                            stage="downloading",
+                        )
                         localized_media_urls = await self._localize_video_media(page, profile, job, media_urls)
                         if localized_media_urls:
                             media_urls = localized_media_urls
