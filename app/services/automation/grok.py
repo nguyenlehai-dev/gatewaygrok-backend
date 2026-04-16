@@ -97,16 +97,31 @@ class GrokAutomationProvider(BaseAutomationProvider):
         if reset_page:
             await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
             await page.wait_for_timeout(1200)
-
-        video_mode_button = await self._wait_for_action_button(
-            page,
-            [
-                "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
-                "[aria-label='Generation mode'] >> text=Video",
-            ],
-            attempts=8,
-            delay_ms=1200,
-        )
+        try:
+            video_mode_button = await self._wait_for_action_button(
+                page,
+                [
+                    "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
+                    "[aria-label='Generation mode'] >> text=Video",
+                ],
+                attempts=8,
+                delay_ms=1200,
+            )
+        except RuntimeError:
+            if not reset_page:
+                await page.goto("https://grok.com/imagine", wait_until="domcontentloaded")
+                await page.wait_for_timeout(1200)
+                video_mode_button = await self._wait_for_action_button(
+                    page,
+                    [
+                        "[aria-label='Generation mode'] button[role='radio']:has-text('Video')",
+                        "[aria-label='Generation mode'] >> text=Video",
+                    ],
+                    attempts=8,
+                    delay_ms=1200,
+                )
+            else:
+                raise
         if await video_mode_button.get_attribute("aria-checked") != "true":
             await video_mode_button.click(timeout=3000)
             await page.wait_for_timeout(600)
