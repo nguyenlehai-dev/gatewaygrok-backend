@@ -1,0 +1,51 @@
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+# Native deps for Playwright/Chromium + a few common libs for tools the
+# automation provider may shell out to (similar set as grokflow-backend).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev curl \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2 libnspr4 \
+    fonts-liberation fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt && pip install gunicorn==23.0.0
+
+# Pin to chromium — the automation provider uses it via Playwright.
+RUN python -m playwright install chromium
+
+COPY . .
+
+# Match the GrokFlow convention (non-root user, uid 10001) so host-side
+# volume permissions can be matched once and reused.
+RUN useradd -m -u 10001 gatewaygrok && \
+    chown -R gatewaygrok:gatewaygrok /app /ms-playwright && \
+    mkdir -p /app/storage/profiles && \
+    chown -R gatewaygrok:gatewaygrok /app/storage
+
+USER gatewaygrok
+
+EXPOSE 8001
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s \
+  CMD curl -fsS http://localhost:8001/api/health || exit 1
+
+# Single uvicorn worker is fine — most work is in the background job runner
+# which can't be parallelized across processes anyway without a queue.
+CMD ["gunicorn", "app.main:app", \
+     "--bind", "0.0.0.0:8001", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--workers", "1", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--timeout", "120"]

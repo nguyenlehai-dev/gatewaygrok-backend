@@ -1,0 +1,34 @@
+# Standalone compose for gatewaygrok-backend.
+# Deploys a single container on host port 8001 — the GrokFlow frontend's
+# nginx proxies /gateway-api/* to host.docker.internal:8001.
+#
+# Quick start on the VPS:
+#   cp .env.example .env  # adjust admin/credentials
+#   docker compose up -d --build
+#
+# Storage lives in ./storage so SQLite DB + profile data survive rebuilds.
+
+services:
+  gateway-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    image: gatewaygrok/backend:latest
+    container_name: gatewaygrok-backend-1
+    restart: unless-stopped
+    env_file: ./.env
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./storage:/app/storage
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
